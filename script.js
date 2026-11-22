@@ -118,12 +118,53 @@ function escaparHtml(s) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
   });
 }
+function limparErrosCampo() {
+  [].forEach.call(document.querySelectorAll('[aria-invalid="true"]'), function (el) {
+    el.removeAttribute("aria-invalid");
+  });
+}
 function mostrarErro(m, f) {
+  limparErrosCampo();
   var e = porId("e");
   if (e) e.innerHTML = '<p class="err" role="alert">' + escaparHtml(m) + "</p>";
   else avisar(m);
   anunciar(m);
-  if (f && porId(f)) porId(f).focus();
+  if (f && porId(f)) {
+    var el = porId(f);
+    el.setAttribute("aria-invalid", "true");
+    el.addEventListener(
+      "input",
+      function () {
+        el.removeAttribute("aria-invalid");
+      },
+      { once: true },
+    );
+    el.focus();
+  }
+}
+// Confirmação em 2 cliques no próprio botão (prevenção de erros sem popup bloqueante).
+function confirmarClique(b, textoConfirmar) {
+  if (b.dataset.conf === "1") {
+    clearTimeout(Number(b.dataset.confT || 0));
+    delete b.dataset.conf;
+    b.classList.remove("warn");
+    return true;
+  }
+  b.dataset.conf = "1";
+  b.dataset.origTxt = b.textContent;
+  b.textContent = textoConfirmar;
+  b.classList.add("warn");
+  anunciar(textoConfirmar + " Clique novamente para confirmar.");
+  b.dataset.confT = String(
+    setTimeout(function () {
+      if (document.body.contains(b) && b.dataset.conf === "1") {
+        delete b.dataset.conf;
+        b.textContent = b.dataset.origTxt || b.textContent;
+        b.classList.remove("warn");
+      }
+    }, 5000),
+  );
+  return false;
 }
 var temporizadorAviso = null;
 function avisar(m) {
@@ -674,7 +715,7 @@ function telaDeLogin() {
       estado.mfa.codigo +
       '</span> <span class="hint" id="mfat"></span></p></div>' +
       '<form id="fmfa" novalidate><label class="f" for="cd">Código</label><input type="text" id="cd" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}">' +
-      '<p class="hint">Tentativas restantes: ' +
+      '<p class="hint" id="mfatr">Tentativas restantes: ' +
       (MFA_MAX_TENTATIVAS - estado.mfa.tentativas) +
       "</p>" +
       '<div id="e"></div><div class="row"><button type="button" id="l0">Voltar</button><button type="button" id="nv">Enviar novo código</button><button class="pri" type="submit" id="l2">Verificar e entrar</button></div></form></div>'
@@ -1297,6 +1338,7 @@ function desenharAtividades(p) {
   [].forEach.call(porId("al").querySelectorAll("button"), function (b) {
     b.onclick = function () {
       if (b.dataset.x) {
+        if (!confirmarClique(b, "Confirmar exclusão?")) return;
         var idx = b.dataset.x;
         return executarUmaVez("at-" + idx, b, function () {
           return Dados.del("atividades", idx).then(function () {
@@ -1639,6 +1681,7 @@ function desenharChamados(p) {
           return x.id === id;
         })[0];
       if (!c) return;
+      if (st === "cancelado" && !confirmarClique(b, "Confirmar cancelamento?")) return;
       executarUmaVez("ch-" + id, b, function () {
         // A coleção "fila" guarda só prioridade/horário/status (sem dados pessoais),
         // para o funcionário saber a posição sem poder ler chamados de outras pessoas.
@@ -1896,6 +1939,9 @@ function aoVerificarMFA() {
         return encerrarSessao("Muitas tentativas incorretas. Por segurança, faça login novamente.");
       });
     }
+    if (porId("mfatr"))
+      porId("mfatr").textContent =
+        "Tentativas restantes: " + (MFA_MAX_TENTATIVAS - m.tentativas);
     porId("cd").value = "";
     return mostrarErro(
       "Código incorreto. Restam " + (MFA_MAX_TENTATIVAS - m.tentativas) + " tentativa(s).",
@@ -1998,36 +2044,58 @@ function ligarEventos() {
   });
 }
 
-/* ---- acessibilidade ---- */
+/* ---- acessibilidade (preferências salvas no navegador) ---- */
+function lerPref(k) {
+  try {
+    return localStorage.getItem("wl-" + k);
+  } catch (e) {
+    return null;
+  }
+}
+function salvarPref(k, v) {
+  try {
+    localStorage.setItem("wl-" + k, String(v));
+  } catch (e) {}
+}
 porId("fp").onclick = function () {
   mudarFonte(2);
 };
 porId("fm").onclick = function () {
   mudarFonte(-2);
 };
-var tamanhoDaFonte = 17;
+var tamanhoDaFonte = Number(lerPref("fs")) || 17;
+if (tamanhoDaFonte !== 17) mudarFonte(0);
 function mudarFonte(d) {
   tamanhoDaFonte = Math.max(14, Math.min(28, tamanhoDaFonte + d));
   document.documentElement.style.setProperty("--fs", tamanhoDaFonte + "px");
+  salvarPref("fs", tamanhoDaFonte);
 }
-porId("ct").onclick = function () {
-  var on = document.documentElement.getAttribute("data-contrast") !== "1";
+function aplicarContraste(on) {
   if (on) document.documentElement.setAttribute("data-contrast", "1");
   else document.documentElement.removeAttribute("data-contrast");
-  this.setAttribute("aria-pressed", on);
+  porId("ct").setAttribute("aria-pressed", on);
+}
+if (lerPref("ct") === "1") aplicarContraste(true);
+porId("ct").onclick = function () {
+  var on = document.documentElement.getAttribute("data-contrast") !== "1";
+  aplicarContraste(on);
+  salvarPref("ct", on ? "1" : "0");
 };
 
 /* ---- modo leve (manual ou automático em rede lenta) ---- */
-var modoLeveManual = false;
+var prefLeve = lerPref("lt"),
+  modoLeveManual = prefLeve !== null;
 function aplicarModoLeve(on, mensagem) {
   document.documentElement.classList.toggle("lite", on);
   porId("lt").setAttribute("aria-pressed", on);
   if (mensagem) anunciar(mensagem);
 }
+if (prefLeve === "1") aplicarModoLeve(true, "");
 porId("lt").onclick = function () {
   modoLeveManual = true;
   var on = !document.documentElement.classList.contains("lite");
   aplicarModoLeve(on, on ? "Modo leve ativado" : "Modo leve desativado");
+  salvarPref("lt", on ? "1" : "0");
 };
 function avaliarRede() {
   var r = infoRede();

@@ -47,3 +47,5 @@ th{font-weight:700}
 .mfa{border:2px dashed var(--bd);border-radius:12px;padding:.7rem;margin:.6rem 0;background:var(--bg)}
 .mfa .cod{font-size:1.5rem;font-weight:700;letter-spacing:.2em}
 .ok{color:var(--ok);font-weight:700}.bad{color:var(--bad);font-weight:700}
+[aria-invalid="true"]{border-color:var(--bad)}
+button.warn{border-color:var(--bad);color:var(--bad);font-weight:700}
