@@ -3,16 +3,54 @@
  * Disciplina: Desenvolvimento de Soluções Remotas
  *
  * Organização do arquivo:
- *   1. Constantes e estado da aplicação
- *   2. Funções auxiliares
- *   3. Camada de dados (Firebase Firestore, com modo local de reserva)
- *   4. Telas: login, monitoramento, atividades, chamados, mural e documentos
- *   5. Eventos, acessibilidade e conexão
- *   6. Configuração do Firebase (no final do arquivo)
- *   7. Se algo cair é culpa do vasco e não foi David que escreveu isso
+ *   1. Configuração do Firebase (valores injetados pelo GitHub Actions a partir dos Secrets)
+ *   2. Constantes e estado da aplicação
+ *   3. Funções auxiliares
+ *   4. Camada de dados (Firestore, com modo local de reserva) e autenticação (Firebase Auth)
+ *   5. Segurança: MFA (simulado), criptografia RSA (assinatura da auditoria), sessão
+ *   6. Telas: login, monitoramento, equipe, atividades, chamados, mural e documentos
+ *   7. Eventos, acessibilidade, rede (QoS) e conexão
  */
 
-var CODIGO_MFA = "123456";
+/* ===== 1. FIREBASE =====
+ * Os marcadores abaixo são substituídos no deploy (.github/workflows/deploy.yml) pelos Secrets
+ * do repositório. Sem eles (ex.: abrindo o arquivo localmente), o app roda em MODO LOCAL.
+ * Observação: a apiKey do Firebase não é uma senha; quem protege os dados são o Firebase
+ * Authentication e as Regras do Firestore (arquivo firestore.rules).
+ */
+var CONFIG_FIREBASE = {
+  apiKey: "__FIREBASE_API_KEY__",
+  authDomain: "__FIREBASE_AUTH_DOMAIN__",
+  projectId: "__FIREBASE_PROJECT_ID__",
+  storageBucket: "__FIREBASE_STORAGE_BUCKET__",
+  messagingSenderId: "__FIREBASE_MESSAGING_SENDER_ID__",
+  appId: "__FIREBASE_APP_ID__",
+};
+var NUVEM_CONFIGURADA = CONFIG_FIREBASE.apiKey.indexOf("__") !== 0;
+var fb = null; // { auth, db, A (módulo auth), F (módulo firestore) }
+var erroNuvem = false;
+var firebasePronto = NUVEM_CONFIGURADA
+  ? (function () {
+      var base = "https://www.gstatic.com/firebasejs/10.14.1/";
+      return Promise.all([
+        import(base + "firebase-app.js"),
+        import(base + "firebase-auth.js"),
+        import(base + "firebase-firestore.js"),
+      ])
+        .then(function (m) {
+          var app = m[0].initializeApp(CONFIG_FIREBASE);
+          // Sessão só em memória: recarregar a página exige novo login (senha + MFA).
+          var auth = m[1].initializeAuth(app, { persistence: m[1].inMemoryPersistence });
+          fb = { auth: auth, db: m[2].getFirestore(app), A: m[1], F: m[2] };
+        })
+        .catch(function (e) {
+          erroNuvem = true;
+          console.warn("Firebase indisponível.", e);
+        });
+    })()
+  : Promise.resolve();
+
+/* ===== 2. CONSTANTES E ESTADO ===== */
 var NOME_DO_PERFIL = {
   func: "Funcionário",
   diamante: "Representante Diamante 💎",
@@ -22,22 +60,10 @@ var NOME_DO_PERFIL = {
 var CATEGORIAS = ["TI e suporte", "Recursos Humanos", "Financeiro", "Infraestrutura"],
   PRIORIDADES = ["Baixa", "Média", "Alta"];
 var DOCUMENTOS = [
-  {
-    n: "Manual do colaborador.pdf",
-    lv: 1,
-  },
-  {
-    n: "Política de segurança da informação.pdf",
-    lv: 1,
-  },
-  {
-    n: "Planejamento trimestral.xlsx",
-    lv: 2,
-  },
-  {
-    n: "Contratos e folha de pagamento.pdf",
-    lv: 3,
-  },
+  { n: "Manual do colaborador.pdf", lv: 1 },
+  { n: "Política de segurança da informação.pdf", lv: 1 },
+  { n: "Planejamento trimestral.xlsx", lv: 2 },
+  { n: "Contratos e folha de pagamento.pdf", lv: 3 },
 ];
 var NIVEL_DE_ACESSO = {
     1: ["func", "diamante", "gestor", "ti"],
@@ -48,21 +74,39 @@ var NIVEL_DE_ACESSO = {
     2: "Representante, Gestor ou TI",
     3: "Gestor ou TI",
   };
+// MFA (simulado): código aleatório, validade curta e limite de tentativas/reenvios.
+var MFA_VALIDADE_MS = 60 * 1000,
+  MFA_MAX_TENTATIVAS = 3,
+  MFA_MAX_ENVIOS = 3;
+// Sessão: encerra após 15 minutos sem interação.
+var LIMITE_INATIVIDADE_MS = 15 * 60 * 1000;
+// Limite de frequência para abrir chamados (também aplicado nas Regras do Firestore).
+var INTERVALO_CHAMADOS_MS = 10 * 1000;
+// QoS da fila: menor peso = atendido antes. Envelhecimento evita que "Baixa" espere para sempre.
+var PESO_PRIORIDADE = { Alta: 0, Média: 1, Baixa: 2 },
+  ENVELHECIMENTO_MS = 30 * 60 * 1000;
+
 var estado = {
-  user: null,
-  auth: 0,
-  tmp: "",
+  user: null, // { uid, nome, email, perfil }
+  tmp: null, // usuário entre a senha e o MFA
+  auth: 0, // 0 = senha, 1 = MFA
+  cadastro: false,
+  mfa: null,
   tab: "atividades",
   ch: [],
   at: [],
   posts: [],
   us: [],
   au: [],
+  fila: [],
+  chaves: [],
   unsubs: [],
   busy: false,
 };
 var areaPrincipal = document.getElementById("v"),
   avisoLeitorTela = document.getElementById("live");
+
+/* ===== 3. FUNÇÕES AUXILIARES ===== */
 function porId(i) {
   return document.getElementById(i);
 }
@@ -71,18 +115,25 @@ function anunciar(t) {
 }
 function escaparHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-    return {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-    }[c];
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
   });
 }
 function mostrarErro(m, f) {
-  porId("e").innerHTML = '<p class="err" role="alert">' + escaparHtml(m) + "</p>";
+  var e = porId("e");
+  if (e) e.innerHTML = '<p class="err" role="alert">' + escaparHtml(m) + "</p>";
+  else avisar(m);
   anunciar(m);
   if (f && porId(f)) porId(f).focus();
+}
+var temporizadorAviso = null;
+function avisar(m) {
+  var a = porId("aviso");
+  a.textContent = m;
+  a.hidden = false;
+  clearTimeout(temporizadorAviso);
+  temporizadorAviso = setTimeout(function () {
+    a.hidden = true;
+  }, 7000);
 }
 function perfilAtual() {
   return estado.user ? estado.user.perfil : "";
@@ -96,11 +147,14 @@ function ehRepresentante() {
 function ehTI() {
   return perfilAtual() === "ti";
 }
+function ehFuncionario() {
+  return perfilAtual() === "func";
+}
 function podeAdministrar() {
   return ehGestor() || ehRepresentante();
 }
 function podeGerenciar(a) {
-  return ehGestor() || (ehRepresentante() && a.por === estado.user.nome);
+  return ehGestor() || (ehRepresentante() && a.porUid === estado.user.uid);
 }
 function podeVerDocumento(l) {
   return NIVEL_DE_ACESSO[l].indexOf(perfilAtual()) >= 0;
@@ -113,11 +167,7 @@ function normalizar(x) {
 function dataDeHoje() {
   var d = new Date();
   return (
-    d.getFullYear() +
-    "-" +
-    ("0" + (d.getMonth() + 1)).slice(-2) +
-    "-" +
-    ("0" + d.getDate()).slice(-2)
+    d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) + "-" + ("0" + d.getDate()).slice(-2)
   );
 }
 function formatarData(d) {
@@ -126,89 +176,483 @@ function formatarData(d) {
 function gerarId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
+function paraBase64(buf) {
+  var b = new Uint8Array(buf),
+    s = "";
+  for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s);
+}
+function deBase64(t) {
+  var s = atob(t),
+    b = new Uint8Array(s.length);
+  for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+  return b;
+}
+// Botões em processamento: evita cliques repetidos (formulários).
+function ocupar(b, texto) {
+  estado.busy = true;
+  if (!b) return;
+  b.disabled = true;
+  b.dataset.txt = b.textContent;
+  b.innerHTML = '<span class="spin" aria-hidden="true"></span> ' + texto;
+}
+function liberar(b) {
+  estado.busy = false;
+  if (b && document.body.contains(b)) {
+    b.disabled = false;
+    b.textContent = b.dataset.txt || b.textContent;
+  }
+}
+// Ações por item (confirmar, concluir, excluir...): ignora repetições até a anterior terminar.
+var acoesEmAndamento = {};
+function executarUmaVez(chave, botao, fn) {
+  if (acoesEmAndamento[chave]) return;
+  acoesEmAndamento[chave] = true;
+  if (botao) botao.disabled = true;
+  return Promise.resolve()
+    .then(fn)
+    .catch(function (e) {
+      console.warn(e);
+      avisar(
+        e && e.code === "permission-denied"
+          ? "Ação bloqueada pelas regras de segurança do servidor para o seu perfil."
+          : "Não foi possível concluir a ação. Tente novamente.",
+      );
+    })
+    .then(function () {
+      delete acoesEmAndamento[chave];
+      if (botao && document.body.contains(botao)) botao.disabled = false;
+    });
+}
 
-/* ---- camada de dados: nuvem (db) ou local ---- */
-var banco = null,
-  COLECOES = ["chamados", "posts", "atividades", "usuarios", "auditoria"],
+/* ===== 4. CAMADA DE DADOS ===== */
+var COLECOES = ["chamados", "posts", "atividades", "usuarios", "auditoria", "fila", "chaves", "limites"],
   memoriaLocal = {},
   ouvintesLocais = {};
 COLECOES.forEach(function (n) {
   memoriaLocal[n] = {};
   ouvintesLocais[n] = [];
 });
-function listarMemoria(n) {
-  return Object.keys(memoriaLocal[n]).map(function (k) {
-    return Object.assign(
-      {
-        id: k,
-      },
-      memoriaLocal[n][k],
-    );
-  });
+function listarMemoria(n, filtro) {
+  return Object.keys(memoriaLocal[n])
+    .map(function (k) {
+      return Object.assign({ id: k }, memoriaLocal[n][k]);
+    })
+    .filter(function (x) {
+      if (!filtro) return true;
+      if (filtro[1] === "==") return x[filtro[0]] === filtro[2];
+      return (x[filtro[0]] || []).indexOf(filtro[2]) >= 0; // array-contains
+    });
 }
 function avisarOuvintes(n) {
-  ouvintesLocais[n].forEach(function (f) {
-    f(listarMemoria(n));
+  ouvintesLocais[n].forEach(function (o) {
+    o.cb(listarMemoria(n, o.filtro));
+  });
+}
+// Latência das gravações na nuvem (exibida no painel de monitoramento).
+var latencias = [];
+function medir(p) {
+  var t0 = performance.now();
+  return p.then(function (r) {
+    latencias.push(performance.now() - t0);
+    if (latencias.length > 20) latencias.shift();
+    return r;
   });
 }
 var Dados = {
-  sub: function (n, cb) {
-    if (banco)
-      return banco.collection(n).onSnapshot(
+  // filtro opcional: [campo, "==" | "array-contains", valor]
+  sub: function (n, cb, filtro) {
+    if (fb) {
+      var F = fb.F,
+        ref = F.collection(fb.db, n);
+      if (filtro) ref = F.query(ref, F.where(filtro[0], filtro[1], filtro[2]));
+      return F.onSnapshot(
+        ref,
         function (sn) {
           cb(
             sn.docs.map(function (d) {
-              return Object.assign(
-                {
-                  id: d.id,
-                },
-                d.data(),
-              );
+              return Object.assign({ id: d.id }, d.data());
             }),
           );
         },
-        function () {
-          cb(listarMemoria(n));
+        function (e) {
+          console.warn("Leitura negada ou indisponível em " + n, e);
+          cb([]);
         },
       );
-    ouvintesLocais[n].push(cb);
-    cb(listarMemoria(n));
+    }
+    var o = { cb: cb, filtro: filtro };
+    ouvintesLocais[n].push(o);
+    cb(listarMemoria(n, filtro));
     return function () {
-      ouvintesLocais[n] = ouvintesLocais[n].filter(function (f) {
-        return f !== cb;
+      ouvintesLocais[n] = ouvintesLocais[n].filter(function (x) {
+        return x !== o;
       });
     };
   },
+  get: function (n, id) {
+    if (fb)
+      return fb.F.getDoc(fb.F.doc(fb.db, n, id)).then(function (s) {
+        return s.exists() ? Object.assign({ id: s.id }, s.data()) : null;
+      });
+    var x = memoriaLocal[n][id];
+    return Promise.resolve(x ? Object.assign({ id: id }, x) : null);
+  },
   set: function (n, id, o) {
-    if (banco) return banco.collection(n).doc(id).set(o);
-    memoriaLocal[n][id] = o;
+    if (fb) return medir(fb.F.setDoc(fb.F.doc(fb.db, n, id), o));
+    memoriaLocal[n][id] = Object.assign({}, o);
     avisarOuvintes(n);
     return Promise.resolve();
   },
   upd: function (n, id, o) {
-    if (banco) return banco.collection(n).doc(id).update(o);
+    if (fb) return medir(fb.F.updateDoc(fb.F.doc(fb.db, n, id), o));
+    if (!memoriaLocal[n][id]) return Promise.reject({ code: "not-found" });
     Object.assign(memoriaLocal[n][id], o);
     avisarOuvintes(n);
     return Promise.resolve();
   },
   del: function (n, id) {
-    if (banco) return banco.collection(n).doc(id).delete();
+    if (fb) return medir(fb.F.deleteDoc(fb.F.doc(fb.db, n, id)));
     delete memoriaLocal[n][id];
     avisarOuvintes(n);
     return Promise.resolve();
   },
+  // Várias gravações atômicas. ops: [tipo ("set"|"merge"|"upd"|"del"), colecao, id, objeto]
+  lote: function (ops) {
+    if (fb) {
+      var F = fb.F,
+        b = F.writeBatch(fb.db);
+      ops.forEach(function (op) {
+        var r = F.doc(fb.db, op[1], op[2]);
+        if (op[0] === "set") b.set(r, op[3]);
+        else if (op[0] === "merge") b.set(r, op[3], { merge: true });
+        else if (op[0] === "upd") b.update(r, op[3]);
+        else b.delete(r);
+      });
+      return medir(b.commit());
+    }
+    var tocadas = {};
+    ops.forEach(function (op) {
+      var m = memoriaLocal[op[1]];
+      if (op[0] === "set") m[op[2]] = Object.assign({}, op[3]);
+      else if (op[0] === "merge" || op[0] === "upd") m[op[2]] = Object.assign(m[op[2]] || {}, op[3]);
+      else delete m[op[2]];
+      tocadas[op[1]] = 1;
+    });
+    Object.keys(tocadas).forEach(avisarOuvintes);
+    return Promise.resolve();
+  },
+  // Cria um documento registrando o horário do servidor em limites/{uid}.
+  // As Regras do Firestore recusam se a última criação foi há menos de 10 s (anti-abuso).
+  criarComLimite: function (n, id, o) {
+    var uid = estado.user.uid;
+    if (fb) {
+      var F = fb.F,
+        b = F.writeBatch(fb.db);
+      b.set(F.doc(fb.db, n, id), o);
+      b.set(F.doc(fb.db, "limites", uid), { ultimo: F.serverTimestamp() });
+      return medir(b.commit());
+    }
+    var l = memoriaLocal.limites[uid];
+    if (l && Date.now() - l.ultimo < INTERVALO_CHAMADOS_MS) return Promise.reject({ code: "limite" });
+    memoriaLocal.limites[uid] = { ultimo: Date.now() };
+    return Dados.set(n, id, o);
+  },
 };
-function registrarAuditoria(a) {
-  var u = estado.user || estado.tmp || {};
-  Dados.set("auditoria", "L" + gerarId(), {
-    quem: u.nome || "?",
-    perfil: u.perfil || "?",
-    acao: a,
-    quando: Date.now(),
-  });
+
+/* ---- autenticação (Firebase Authentication; no modo local, contas em memória) ---- */
+var contasLocais = {};
+function resumoSenha(s) {
+  if (!window.crypto || !crypto.subtle) return Promise.resolve(s);
+  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)).then(paraBase64);
+}
+var Autenticacao = {
+  entrar: function (email, senha) {
+    if (fb)
+      return fb.A.signInWithEmailAndPassword(fb.auth, email, senha).then(function (c) {
+        return { uid: c.user.uid, email: c.user.email };
+      });
+    return resumoSenha(senha).then(function (h) {
+      var c = contasLocais[email];
+      if (!c || c.senha !== h) throw { code: "auth/invalid-credential" };
+      return { uid: c.uid, email: email };
+    });
+  },
+  cadastrar: function (email, senha) {
+    if (fb)
+      return fb.A.createUserWithEmailAndPassword(fb.auth, email, senha).then(function (c) {
+        return { uid: c.user.uid, email: c.user.email };
+      });
+    if (contasLocais[email]) return Promise.reject({ code: "auth/email-already-in-use" });
+    return resumoSenha(senha).then(function (h) {
+      contasLocais[email] = { uid: "U" + gerarId(), senha: h };
+      return { uid: contasLocais[email].uid, email: email };
+    });
+  },
+  sair: function () {
+    return fb ? fb.A.signOut(fb.auth) : Promise.resolve();
+  },
+};
+function mensagemErroAuth(e) {
+  var c = (e && e.code) || "";
+  return (
+    {
+      "auth/invalid-credential": "E-mail ou senha incorretos.",
+      "auth/wrong-password": "E-mail ou senha incorretos.",
+      "auth/user-not-found": "E-mail ou senha incorretos.",
+      "auth/invalid-email": "E-mail inválido.",
+      "auth/email-already-in-use": "Este e-mail já está cadastrado. Use “Já tenho conta”.",
+      "auth/weak-password": "Senha fraca: use pelo menos 8 caracteres, com letras e números.",
+      "auth/password-does-not-meet-requirements":
+        "A senha não atende à política de senhas da empresa.",
+      "auth/too-many-requests": "Muitas tentativas. Aguarde alguns minutos e tente de novo.",
+      "auth/network-request-failed": "Sem conexão com o servidor. Verifique sua internet.",
+      "auth/operation-not-allowed": "O login por e-mail e senha não está ativado no Firebase.",
+      "sem-nuvem":
+        "Não foi possível conectar ao servidor. Verifique sua internet e recarregue a página.",
+    }[c] || "Não foi possível entrar. Tente novamente."
+  );
 }
 
-/* ---- telas ---- */
+/* ===== 5. SEGURANÇA ===== */
+
+/* ---- Criptografia RSA (Web Crypto API) ----
+ * Cada usuário gera no próprio aparelho um par de chaves RSA-PSS de 2048 bits.
+ * A chave privada é marcada como NÃO exportável e fica no IndexedDB do navegador;
+ * só a chave pública vai para a nuvem (coleção "chaves", imutável pelas regras).
+ * Todo registro de auditoria é assinado; a TI verifica a assinatura com a chave pública
+ * e detecta registros forjados ou adulterados.
+ */
+function abrirCofre() {
+  return new Promise(function (ok, falha) {
+    if (!window.indexedDB) return falha(new Error("sem IndexedDB"));
+    var r = indexedDB.open("worklink-chaves", 1);
+    r.onupgradeneeded = function () {
+      r.result.createObjectStore("pares");
+    };
+    r.onsuccess = function () {
+      ok(r.result);
+    };
+    r.onerror = function () {
+      falha(r.error);
+    };
+  });
+}
+function cofreLer(k) {
+  return abrirCofre().then(function (db) {
+    return new Promise(function (ok, falha) {
+      var q = db.transaction("pares").objectStore("pares").get(k);
+      q.onsuccess = function () {
+        ok(q.result);
+      };
+      q.onerror = function () {
+        falha(q.error);
+      };
+    });
+  });
+}
+function cofreGravar(k, v) {
+  return abrirCofre().then(function (db) {
+    return new Promise(function (ok, falha) {
+      var q = db.transaction("pares", "readwrite").objectStore("pares").put(v, k);
+      q.onsuccess = function () {
+        ok();
+      };
+      q.onerror = function () {
+        falha(q.error);
+      };
+    });
+  });
+}
+var ALG_RSA = { name: "RSA-PSS", hash: "SHA-256" },
+  PARAM_ASSINATURA = { name: "RSA-PSS", saltLength: 32 };
+var Cripto = {
+  pronto: null,
+  kid: null,
+  privada: null,
+  preparar: function (uid) {
+    Cripto.kid = null;
+    Cripto.privada = null;
+    if (!window.crypto || !crypto.subtle) return (Cripto.pronto = Promise.resolve());
+    var chave = (NUVEM_CONFIGURADA ? CONFIG_FIREBASE.projectId : "local") + ":" + uid;
+    Cripto.pronto = cofreLer(chave)
+      .catch(function () {
+        return null;
+      })
+      .then(function (salvo) {
+        if (salvo && salvo.kid && salvo.par) return salvo;
+        return crypto.subtle
+          .generateKey(
+            {
+              name: "RSA-PSS",
+              modulusLength: 2048,
+              publicExponent: new Uint8Array([1, 0, 1]),
+              hash: "SHA-256",
+            },
+            false, // chave privada não exportável
+            ["sign", "verify"],
+          )
+          .then(function (par) {
+            var novo = { kid: "K" + gerarId(), par: par };
+            return cofreGravar(chave, novo)
+              .catch(function () {})
+              .then(function () {
+                return novo;
+              });
+          });
+      })
+      .then(function (s) {
+        Cripto.kid = s.kid;
+        Cripto.privada = s.par.privateKey;
+        return Dados.get("chaves", s.kid).then(function (doc) {
+          if (doc) return;
+          return crypto.subtle.exportKey("jwk", s.par.publicKey).then(function (jwk) {
+            return Dados.set("chaves", s.kid, {
+              uid: uid,
+              jwk: JSON.stringify(jwk),
+              criado: Date.now(),
+            });
+          });
+        });
+      })
+      .catch(function (e) {
+        console.warn("Assinatura RSA indisponível.", e);
+        Cripto.kid = null;
+        Cripto.privada = null;
+      });
+    return Cripto.pronto;
+  },
+  assinar: function (texto) {
+    return crypto.subtle
+      .sign(PARAM_ASSINATURA, Cripto.privada, new TextEncoder().encode(texto))
+      .then(paraBase64);
+  },
+  verificar: function (jwkTexto, texto, assinatura) {
+    return crypto.subtle
+      .importKey("jwk", JSON.parse(jwkTexto), ALG_RSA, false, ["verify"])
+      .then(function (k) {
+        return crypto.subtle.verify(
+          PARAM_ASSINATURA,
+          k,
+          deBase64(assinatura),
+          new TextEncoder().encode(texto),
+        );
+      });
+  },
+};
+function textoAssinado(e) {
+  return JSON.stringify([e.quemUid, e.perfil, e.acao, e.quando, e.kid]);
+}
+function registrarAuditoria(acao) {
+  var u = estado.user || estado.tmp;
+  if (!u || !u.uid) return Promise.resolve();
+  var e = {
+    quemUid: u.uid,
+    quem: u.nome || u.email || "?",
+    perfil: u.perfil || "?",
+    acao: acao,
+    quando: Date.now(),
+    kid: null,
+    assinatura: null,
+  };
+  return (Cripto.pronto || Promise.resolve())
+    .then(function () {
+      if (!Cripto.privada) return;
+      e.kid = Cripto.kid;
+      return Cripto.assinar(textoAssinado(e)).then(function (s) {
+        e.assinatura = s;
+      });
+    })
+    .catch(function () {
+      e.kid = null;
+      e.assinatura = null;
+    })
+    .then(function () {
+      return Dados.set("auditoria", "L" + gerarId(), e);
+    })
+    .catch(function (err) {
+      console.warn("Auditoria não registrada.", err);
+    });
+}
+
+/* ---- MFA (simulado) ----
+ * Em produção, o código viria de um app autenticador (TOTP) ou SMS via Firebase Identity
+ * Platform. Aqui ele é gerado com crypto.getRandomValues, vale 60 s, aceita 3 tentativas
+ * e 3 envios; ao estourar o limite, a sessão é encerrada e o evento vai para a auditoria.
+ */
+var contagemMFA = null;
+function gerarCodigoMFA() {
+  var n = new Uint32Array(1);
+  crypto.getRandomValues(n);
+  return ("00000" + (n[0] % 1000000)).slice(-6);
+}
+function iniciarMFA() {
+  estado.mfa = {
+    codigo: gerarCodigoMFA(),
+    expira: Date.now() + MFA_VALIDADE_MS,
+    tentativas: 0,
+    envios: 1,
+  };
+}
+function pararContagemMFA() {
+  clearInterval(contagemMFA);
+  contagemMFA = null;
+}
+function iniciarContagemMFA() {
+  pararContagemMFA();
+  var avisouExpirado = false;
+  function tique() {
+    var t = porId("mfat");
+    if (!t || !estado.mfa) return pararContagemMFA();
+    var resta = Math.ceil((estado.mfa.expira - Date.now()) / 1000);
+    if (resta > 0) {
+      t.textContent = "expira em " + resta + " s";
+    } else {
+      t.textContent = "código expirado";
+      porId("mfac").textContent = "------";
+      if (!avisouExpirado) {
+        avisouExpirado = true;
+        anunciar("O código expirou. Peça um novo código.");
+      }
+    }
+  }
+  tique();
+  contagemMFA = setInterval(tique, 1000);
+}
+var encerrando = false;
+function encerrarSessao(msg) {
+  if (encerrando) return Promise.resolve();
+  encerrando = true;
+  estado.unsubs.forEach(function (u) {
+    u && u();
+  });
+  estado.unsubs = [];
+  pararContagemMFA();
+  return Autenticacao.sair()
+    .catch(function () {})
+    .then(function () {
+      estado.user = null;
+      estado.tmp = null;
+      estado.mfa = null;
+      estado.auth = 0;
+      estado.busy = false;
+      estado.ch = [];
+      estado.at = [];
+      estado.us = [];
+      estado.au = [];
+      estado.fila = [];
+      estado.chaves = [];
+      estado.posts = [];
+      Cripto.kid = null;
+      Cripto.privada = null;
+      Cripto.pronto = null;
+      encerrando = false;
+      desenharTela();
+      if (msg) mostrarErro(msg);
+    });
+}
+
+/* ===== 6. TELAS ===== */
 function abasDoPerfil() {
   var t = [
     ["atividades", "Atividades"],
@@ -216,27 +660,61 @@ function abasDoPerfil() {
     ["mural", "Mural"],
     ["docs", "Documentos"],
   ];
+  if (ehGestor()) t.push(["equipe", "Equipe"]);
   if (ehTI()) t.unshift(["monitor", "Monitoramento"]);
   return t;
+}
+function telaDeLogin() {
+  if (estado.auth === 1) {
+    return (
+      '<div class="card narrow"><h2 tabindex="-1" id="ttl">Verificação em duas etapas</h2>' +
+      "<p>Digite o código de 6 dígitos enviado ao seu aplicativo autenticador.</p>" +
+      '<div class="mfa" role="note" aria-label="Aplicativo autenticador simulado"><p class="hint" style="margin:0">📱 Autenticador simulado (demonstração)</p>' +
+      '<p style="margin:.2rem 0"><span class="cod" id="mfac">' +
+      estado.mfa.codigo +
+      '</span> <span class="hint" id="mfat"></span></p></div>' +
+      '<form id="fmfa" novalidate><label class="f" for="cd">Código</label><input type="text" id="cd" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}">' +
+      '<p class="hint">Tentativas restantes: ' +
+      (MFA_MAX_TENTATIVAS - estado.mfa.tentativas) +
+      "</p>" +
+      '<div id="e"></div><div class="row"><button type="button" id="l0">Voltar</button><button type="button" id="nv">Enviar novo código</button><button class="pri" type="submit" id="l2">Verificar e entrar</button></div></form></div>'
+    );
+  }
+  var cad = estado.cadastro;
+  return (
+    '<div class="card narrow"><h2 tabindex="-1" id="ttl">' +
+    (cad ? "Criar conta no WorkLink" : "Entrar no WorkLink") +
+    "</h2>" +
+    (NUVEM_CONFIGURADA
+      ? ""
+      : '<p class="hint">Modo local de demonstração: o Firebase não está configurado, então as contas e os dados ficam só nesta aba.</p>') +
+    '<form id="flogin" novalidate>' +
+    (cad
+      ? '<label class="f" for="nm">Nome completo</label><input type="text" id="nm" autocomplete="name">'
+      : "") +
+    '<label class="f" for="em">E-mail corporativo</label><input type="text" id="em" inputmode="email" autocomplete="username">' +
+    '<label class="f" for="pw">Senha</label><input type="password" id="pw" aria-describedby="pwd" autocomplete="' +
+    (cad ? "new-password" : "current-password") +
+    '">' +
+    (cad
+      ? '<p class="hint" id="pwd">Mínimo de 8 caracteres, com letras e números.</p><label class="f" for="pw2">Confirme a senha</label><input type="password" id="pw2" autocomplete="new-password">' +
+        (NUVEM_CONFIGURADA
+          ? '<p class="hint">Novas contas entram como Funcionário. O Gestor altera o perfil depois.</p>'
+          : '<label class="f" for="pf">Perfil (só no modo local)</label><select id="pf"><option value="func">Funcionário</option><option value="diamante">Representante Diamante 💎</option><option value="gestor">Gestor</option><option value="ti">TI (monitoramento)</option></select>')
+      : '<p class="hint" id="pwd">Protegido por senha e verificação em duas etapas (MFA).</p>') +
+    '<div id="e"></div><div class="row"><button class="pri" type="submit" id="l1">' +
+    (cad ? "Criar conta" : "Continuar") +
+    '</button><button type="button" class="link" id="alt">' +
+    (cad ? "Já tenho conta" : "Criar conta") +
+    "</button></div></form></div>"
+  );
 }
 function desenharTela() {
   var h = "";
   if (!estado.user) {
-    h =
-      '<div class="card narrow"><h2 tabindex="-1" id="ttl">Entrar no WorkLink</h2>' +
-      (estado.auth === 0
-        ? '<label class="f" for="nm">Seu nome</label><input type="text" id="nm" autocomplete="name">' +
-          '<label class="f" for="pf">Perfil de acesso (demonstração)</label><select id="pf"><option value="func">Funcionário</option><option value="diamante">Representante Diamante 💎</option><option value="gestor">Gestor</option><option value="ti">TI (monitoramento)</option></select>' +
-          '<label class="f" for="pw">Senha</label><input type="password" id="pw" autocomplete="current-password">' +
-          '<div id="e"></div><div class="row"><button class="pri" id="l1">Continuar</button></div>'
-        : '<p>Segundo fator (MFA): digite o código de 6 dígitos enviado ao seu aplicativo autenticador.</p><p class="hint">Demonstração: o código é ' +
-          CODIGO_MFA +
-          ".</p>" +
-          '<label class="f" for="cd">Código</label><input type="text" id="cd" inputmode="numeric" autocomplete="one-time-code" maxlength="6">' +
-          '<div id="e"></div><div class="row"><button id="l0">Voltar</button><button class="pri" id="l2">Verificar e entrar</button></div>') +
-      "</div>";
-    areaPrincipal.innerHTML = h;
+    areaPrincipal.innerHTML = telaDeLogin();
     ligarEventos();
+    if (estado.auth === 1) iniciarContagemMFA();
     var t = porId("ttl");
     if (t) {
       t.focus();
@@ -281,14 +759,64 @@ function desenharAbaAtual() {
   if (!p) return;
   ({
     monitor: desenharMonitoramento,
+    equipe: desenharEquipe,
     atividades: desenharAtividades,
     chamados: desenharChamados,
     mural: desenharMural,
     docs: desenharDocumentos,
   })[estado.tab](p);
 }
+var redesenhoAgendado = null;
+function agendarRedesenho() {
+  if (redesenhoAgendado) return;
+  redesenhoAgendado = setTimeout(function () {
+    redesenhoAgendado = null;
+    if (estado.user) desenharAbaAtual();
+  }, 80);
+}
+
+/* ---- rede (QoS) ---- */
+function infoRede() {
+  var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  return c
+    ? { tipo: c.effectiveType, rtt: c.rtt, banda: c.downlink, economia: !!c.saveData }
+    : null;
+}
+function tempoDeCarregamento() {
+  var n = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+  return n && n.domContentLoadedEventEnd ? Math.round(n.domContentLoadedEventEnd) : null;
+}
 
 /* ---- monitoramento (TI) ---- */
+var verificacoes = {};
+function verificarRegistro(x) {
+  if (verificacoes[x.id]) return verificacoes[x.id];
+  if (!x.assinatura || !x.kid) return (verificacoes[x.id] = "sem");
+  var ch = estado.chaves.filter(function (k) {
+    return k.id === x.kid;
+  })[0];
+  if (!ch) return "semchave"; // a chave pode ainda não ter chegado; não guarda em cache
+  if (ch.uid !== x.quemUid) return (verificacoes[x.id] = "falha");
+  verificacoes[x.id] = "verificando";
+  Cripto.verificar(ch.jwk, textoAssinado(x), x.assinatura)
+    .then(function (ok) {
+      verificacoes[x.id] = ok ? "ok" : "falha";
+    })
+    .catch(function () {
+      verificacoes[x.id] = "falha";
+    })
+    .then(function () {
+      if (estado.tab === "monitor") agendarRedesenho();
+    });
+  return "verificando";
+}
+var ROTULO_ASSINATURA = {
+  ok: '<span class="ok">✔ Íntegra</span>',
+  falha: '<span class="bad">✖ Inválida</span>',
+  verificando: '<span class="hint">Verificando…</span>',
+  sem: '<span class="hint">Sem assinatura</span>',
+  semchave: '<span class="hint">Chave não encontrada</span>',
+};
 function desenharMonitoramento(p) {
   var n = function (k) {
       return estado.ch.filter(function (a) {
@@ -305,27 +833,62 @@ function desenharMonitoramento(p) {
       return a.prazo && a.prazo < td && !fim(a);
     }).length,
     ok = estado.at.filter(fim).length,
-    pc = {
-      func: 0,
-      diamante: 0,
-      gestor: 0,
-      ti: 0,
-    };
+    pc = { func: 0, diamante: 0, gestor: 0, ti: 0 };
   estado.us.forEach(function (u) {
     pc[u.perfil] = (pc[u.perfil] || 0) + 1;
   });
+  var leve = document.documentElement.classList.contains("lite");
   var L = estado.au
     .slice()
     .sort(function (a, b) {
       return b.quando - a.quando;
     })
-    .slice(0, 40);
+    .slice(0, leve ? 15 : 40);
+  var res = L.map(function (x) {
+      return verificarRegistro(x);
+    }),
+    integros = res.filter(function (r) {
+      return r === "ok";
+    }).length,
+    invalidos = res.filter(function (r) {
+      return r === "falha";
+    }).length;
+  var r = infoRede(),
+    lat = latencias.length
+      ? Math.round(
+          latencias.reduce(function (s, x) {
+            return s + x;
+          }, 0) / latencias.length,
+        )
+      : null,
+    carga = tempoDeCarregamento();
   p.innerHTML =
     '<h3>Visão geral do sistema (somente leitura)</h3><div class="cols">' +
-    '<section class="col" aria-label="Conexão"><h3>Infraestrutura</h3><p>Conexão: <strong>' +
+    '<section class="col" aria-label="Rede e QoS"><h3>Rede e QoS</h3><p>Conexão: <strong>' +
     (navigator.onLine ? "online" : "offline") +
-    "</strong></p><p>Armazenamento: <strong>" +
-    (banco ? "nuvem, tempo real" : "local, só esta aba") +
+    "</strong><br>" +
+    (r
+      ? "Tipo efetivo: <strong>" +
+        escaparHtml(r.tipo || "?") +
+        "</strong><br>Latência estimada (RTT): <strong>" +
+        r.rtt +
+        " ms</strong><br>Banda estimada: <strong>" +
+        r.banda +
+        " Mbit/s</strong><br>Economia de dados: <strong>" +
+        (r.economia ? "sim" : "não") +
+        "</strong>"
+      : '<span class="hint">Informações de rede indisponíveis neste navegador.</span>') +
+    "<br>Modo leve: <strong>" +
+    (leve ? "ativo" : "inativo") +
+    '</strong></p><p class="hint">O navegador informa no máximo “4g”; redes 5G aparecem como 4g.</p></section>' +
+    '<section class="col" aria-label="Desempenho"><h3>Desempenho</h3><p>Carregamento da página: <strong>' +
+    (carga != null ? carga + " ms" : "—") +
+    "</strong><br>Latência média de gravação na nuvem: <strong>" +
+    (lat != null ? lat + " ms" : "—") +
+    "</strong>" +
+    (latencias.length ? " (últimas " + latencias.length + ")" : "") +
+    "<br>Armazenamento: <strong>" +
+    (fb ? "nuvem, tempo real" : "local, só esta aba") +
     "</strong></p></section>" +
     '<section class="col" aria-label="Usuários"><h3>Usuários (' +
     estado.us.length +
@@ -360,12 +923,27 @@ function desenharMonitoramento(p) {
     "<br>Em andamento: " +
     (estado.at.length - ok - atr) +
     "</p></section></div>" +
+    '<details class="card"><summary><strong>Arquitetura e segurança da solução</strong></summary><ul>' +
+    "<li><strong>Front-end:</strong> GitHub Pages (hospedagem estática com CDN e HTTPS/TLS).</li>" +
+    "<li><strong>Back-end como serviço (PaaS/BaaS):</strong> Firebase Authentication (login) e Cloud Firestore (dados em tempo real).</li>" +
+    "<li><strong>Armazenamento:</strong> Firestore gerenciado pelo Google Cloud, com replicação automática (substitui SAN/NAS próprios).</li>" +
+    "<li><strong>Firewall de aplicação:</strong> Regras do Firestore por perfil, com limite de frequência para novos chamados.</li>" +
+    "<li><strong>Autenticação:</strong> e-mail e senha + segundo fator (MFA simulado no protótipo), sessão encerrada após 15 min sem atividade.</li>" +
+    "<li><strong>Criptografia:</strong> TLS no transporte; assinatura digital RSA-PSS 2048 bits em cada registro de auditoria.</li>" +
+    "<li><strong>Navegador:</strong> Content-Security-Policy restringe scripts e conexões aos domínios do próprio site e do Firebase.</li>" +
+    "<li><strong>QoS:</strong> fila de chamados ordenada por prioridade, com envelhecimento; modo leve automático em redes lentas.</li>" +
+    "</ul></details>" +
     '<h3 style="margin-top:1rem">Registro de auditoria (últimos ' +
     L.length +
     ")</h3>" +
     (L.length
-      ? '<div class="tw"><table><thead><tr><th>Data e hora</th><th>Usuário</th><th>Perfil</th><th>Ação</th></tr></thead><tbody>' +
-        L.map(function (x) {
+      ? '<p class="hint">Assinaturas RSA: ' +
+        integros +
+        " íntegra(s), " +
+        invalidos +
+        " inválida(s).</p>" +
+        '<div class="tw"><table><thead><tr><th>Data e hora</th><th>Usuário</th><th>Perfil</th><th>Ação</th><th>Assinatura RSA</th></tr></thead><tbody>' +
+        L.map(function (x, i) {
           return (
             "<tr><td>" +
             new Date(x.quando).toLocaleString("pt-BR") +
@@ -374,14 +952,84 @@ function desenharMonitoramento(p) {
             "</td><td>" +
             escaparHtml(NOME_DO_PERFIL[x.perfil] || x.perfil) +
             "</td><td>" +
-            (/Falha/.test(x.acao)
+            (/Falha|bloqueado/i.test(x.acao)
               ? '<span class="tag x">' + escaparHtml(x.acao) + "</span>"
               : escaparHtml(x.acao)) +
+            "</td><td>" +
+            ROTULO_ASSINATURA[res[i]] +
             "</td></tr>"
           );
         }).join("") +
         "</tbody></table></div>"
       : '<p class="hint">Nenhum evento registrado ainda.</p>');
+}
+
+/* ---- equipe (somente Gestor altera perfis) ---- */
+function desenharEquipe(p) {
+  var L = estado.us.slice().sort(function (a, b) {
+    return String(a.nome).localeCompare(String(b.nome));
+  });
+  p.innerHTML =
+    '<h3>Equipe e perfis de acesso</h3><p class="hint">Novos cadastros entram como Funcionário. Somente o Gestor altera perfis; a mesma regra é aplicada no servidor pelas Regras do Firestore.</p>' +
+    (L.length
+      ? '<div class="tw"><table><thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Ação</th></tr></thead><tbody>' +
+        L.map(function (u) {
+          var eu = u.id === estado.user.uid;
+          return (
+            "<tr><td>" +
+            escaparHtml(u.nome) +
+            (eu ? " (você)" : "") +
+            "</td><td>" +
+            escaparHtml(u.email || "—") +
+            '</td><td><select id="pf-' +
+            escaparHtml(u.id) +
+            '" aria-label="Perfil de ' +
+            escaparHtml(u.nome) +
+            '"' +
+            (eu ? " disabled" : "") +
+            ">" +
+            Object.keys(NOME_DO_PERFIL)
+              .map(function (k) {
+                return (
+                  '<option value="' +
+                  k +
+                  '"' +
+                  (u.perfil === k ? " selected" : "") +
+                  ">" +
+                  NOME_DO_PERFIL[k] +
+                  "</option>"
+                );
+              })
+              .join("") +
+            "</select></td><td>" +
+            (eu
+              ? '<span class="hint">Seu próprio perfil não pode ser alterado aqui.</span>'
+              : '<button class="sm pri" data-u="' +
+                escaparHtml(u.id) +
+                '" aria-label="Salvar perfil de ' +
+                escaparHtml(u.nome) +
+                '">Salvar</button>') +
+            "</td></tr>"
+          );
+        }).join("") +
+        "</tbody></table></div>"
+      : '<p class="hint">Nenhum usuário cadastrado ainda.</p>');
+  [].forEach.call(p.querySelectorAll("button[data-u]"), function (b) {
+    b.onclick = function () {
+      var id = b.dataset.u,
+        novo = porId("pf-" + id).value,
+        u = estado.us.filter(function (x) {
+          return x.id === id;
+        })[0];
+      if (!u || u.perfil === novo) return anunciar("Nenhuma alteração para salvar");
+      executarUmaVez("perfil-" + id, b, function () {
+        return Dados.upd("usuarios", id, { perfil: novo }).then(function () {
+          registrarAuditoria("Alterou o perfil de " + u.nome + " para " + NOME_DO_PERFIL[novo]);
+          anunciar("Perfil de " + u.nome + " atualizado");
+        });
+      });
+    };
+  });
 }
 
 /* ---- atividades ---- */
@@ -392,7 +1040,7 @@ function membrosPermitidos() {
       return a.indexOf(u.perfil) >= 0;
     })
     .sort(function (a, b) {
-      return a.nome.localeCompare(b.nome);
+      return String(a.nome).localeCompare(String(b.nome));
     });
 }
 function opcoesDeMembros(sel) {
@@ -402,9 +1050,9 @@ function opcoesDeMembros(sel) {
       .map(function (u) {
         return (
           '<option value="' +
-          escaparHtml(u.nome) +
+          escaparHtml(u.id) +
           '"' +
-          (u.nome === sel ? " selected" : "") +
+          (u.id === sel ? " selected" : "") +
           ">" +
           escaparHtml(u.nome) +
           " (" +
@@ -429,11 +1077,13 @@ function atualizarListasDeMembros() {
   });
 }
 function atividadeVisivel(a) {
-  var me = normalizar(estado.user.nome),
-    m = a.membros.some(function (x) {
-      return normalizar(x.nome) === me;
-    });
-  return ehGestor() || ehTI() || m || (ehRepresentante() && a.por === estado.user.nome);
+  var uid = estado.user.uid;
+  return (
+    ehGestor() ||
+    ehTI() ||
+    (a.membrosUids || []).indexOf(uid) >= 0 ||
+    (ehRepresentante() && a.porUid === uid)
+  );
 }
 function desenharAtividades(p) {
   if (!porId("al")) {
@@ -441,7 +1091,7 @@ function desenharAtividades(p) {
       ? "Modo vigilância: você vê todas as atividades, sem poder alterá-las."
       : ehRepresentante()
         ? ""
-        : "Seu perfil é de consulta: você vê as atividades em que o seu nome foi indicado.";
+        : "Seu perfil é de consulta: você vê as atividades em que foi indicado.";
     p.innerHTML =
       (podeAdministrar()
         ? "<h3>Nova atividade para uma equipe</h3>" +
@@ -453,7 +1103,11 @@ function desenharAtividades(p) {
           '"></div></div><label class="f" for="atr">Requisitos de entrega</label><textarea id="atr" rows="2" placeholder="O que precisa estar pronto para a atividade ser aceita"></textarea><fieldset style="border:0;padding:0;margin:.8rem 0 0"><legend class="f">Membros e responsabilidades</legend><div id="mrows">' +
           linhaDeMembro() +
           linhaDeMembro() +
-          '</div><div class="row"><button class="sm" id="addm">+ Adicionar membro</button><button class="sm" id="seedu">Carregar funcionários de exemplo</button></div></fieldset><div id="e"></div><div class="row"><button class="pri" id="adda">Criar atividade</button></div>'
+          '</div><div class="row"><button class="sm" id="addm">+ Adicionar membro</button>' +
+          (fb
+            ? ""
+            : '<button class="sm" id="seedu">Carregar funcionários de exemplo</button>') +
+          '</div><p class="hint">Só aparecem pessoas que já criaram conta no WorkLink.</p></fieldset><div id="e"></div><div class="row"><button class="pri" id="adda">Criar atividade</button></div>'
         : '<p class="hint">' + hint + "</p>") + '<div id="al"></div>';
     if (porId("addm"))
       porId("addm").onclick = function () {
@@ -469,8 +1123,9 @@ function desenharAtividades(p) {
           ["Carla", "func"],
           ["Diego", "diamante"],
         ].forEach(function (x) {
-          Dados.set("usuarios", normalizar(x[0]), {
+          Dados.set("usuarios", "ex-" + normalizar(x[0]), {
             nome: x[0],
+            email: normalizar(x[0]) + "@exemplo.com",
             perfil: x[1],
             ultimo: Date.now(),
           });
@@ -486,18 +1141,19 @@ function desenharAtividades(p) {
           rq = porId("atr").value.trim(),
           m = [],
           seen = {},
-          bad = "";
+          bad = "",
+          permitidos = membrosPermitidos();
         [].forEach.call(porId("mrows").querySelectorAll(".mrow"), function (r) {
-          var n = r.querySelector(".mn").value,
+          var id = r.querySelector(".mn").value,
             x = r.querySelector(".mr").value.trim();
-          if (n && x) {
-            if (seen[n]) bad = "Cada membro só pode aparecer uma vez.";
-            seen[n] = 1;
-            m.push({
-              nome: n,
-              resp: x,
-              feito: false,
-            });
+          if (id && x) {
+            if (seen[id]) bad = "Cada membro só pode aparecer uma vez.";
+            seen[id] = 1;
+            var u = permitidos.filter(function (z) {
+              return z.id === id;
+            })[0];
+            if (!u) bad = "Seu perfil não permite atribuir atividade a esse membro.";
+            m.push({ uid: id, nome: u ? u.nome : "?", resp: x, feito: false });
           }
         });
         if (t.length < 3) return mostrarErro("Digite o título da atividade.", "atl");
@@ -506,21 +1162,13 @@ function desenharAtividades(p) {
         if (rq.length < 3) return mostrarErro("Descreva os requisitos de entrega.", "atr");
         if (!m.length)
           return mostrarErro(
-            membrosPermitidos().length
+            permitidos.length
               ? "Escolha pelo menos um membro e escreva a responsabilidade dele."
-              : "Ainda não há funcionários cadastrados. Use “Carregar funcionários de exemplo” ou peça para eles entrarem uma vez.",
+              : "Ainda não há funcionários cadastrados. Peça para eles criarem conta no WorkLink.",
           );
         if (bad) return mostrarErro(bad);
-        var allow = membrosPermitidos().map(function (u) {
-          return u.nome;
-        });
-        for (var i = 0; i < m.length; i++)
-          if (allow.indexOf(m[i].nome) < 0)
-            return mostrarErro("Seu perfil não permite atribuir atividade a " + m[i].nome + ".");
-        estado.busy = true;
         var b = porId("adda");
-        b.disabled = true;
-        b.innerHTML = '<span class="spin" aria-hidden="true"></span> Criando…';
+        ocupar(b, "Criando…");
         var id = "AT-" + Date.now().toString(36).toUpperCase();
         Dados.set("atividades", id, {
           titulo: t,
@@ -528,14 +1176,16 @@ function desenharAtividades(p) {
           prazo: pz,
           requisitos: rq,
           membros: m,
+          membrosUids: m.map(function (x) {
+            return x.uid;
+          }),
           criado: Date.now(),
           por: estado.user.nome,
+          porUid: estado.user.uid,
         })
           .then(function () {
             registrarAuditoria("Criou a atividade " + id + " (" + t + ")");
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Criar atividade";
+            liberar(b);
             ["atl", "ate", "atp", "atr"].forEach(function (i) {
               porId(i).value = "";
             });
@@ -547,9 +1197,7 @@ function desenharAtividades(p) {
             anunciar("Atividade criada");
           })
           .catch(function () {
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Criar atividade";
+            liberar(b);
             mostrarErro("Não foi possível criar a atividade. Tente novamente.");
           });
       };
@@ -611,7 +1259,7 @@ function desenharAtividades(p) {
               .map(function (x, i) {
                 return (
                   "<li>" +
-                  (x.feito ? "✔ " : "") +
+                  (x.feito ? '<span aria-hidden="true">✔ </span>' : "") +
                   "<strong>" +
                   escaparHtml(x.nome) +
                   "</strong>: " +
@@ -621,7 +1269,7 @@ function desenharAtividades(p) {
                     : ' <span class="tag">Pendente</span>') +
                   (mg && !x.feito
                     ? ' <button class="sm pri" data-a="' +
-                      a.id +
+                      escaparHtml(a.id) +
                       '" data-i="' +
                       i +
                       '" aria-label="Marcar a parte de ' +
@@ -637,7 +1285,7 @@ function desenharAtividades(p) {
             "</ul>" +
             (mg
               ? '<button class="sm" data-x="' +
-                a.id +
+                escaparHtml(a.id) +
                 '" aria-label="Excluir atividade ' +
                 escaparHtml(a.titulo) +
                 '">Excluir atividade</button>'
@@ -649,31 +1297,30 @@ function desenharAtividades(p) {
   [].forEach.call(porId("al").querySelectorAll("button"), function (b) {
     b.onclick = function () {
       if (b.dataset.x) {
-        Dados.del("atividades", b.dataset.x);
-        registrarAuditoria("Excluiu a atividade " + b.dataset.x);
-        anunciar("Atividade excluída");
-        return;
+        var idx = b.dataset.x;
+        return executarUmaVez("at-" + idx, b, function () {
+          return Dados.del("atividades", idx).then(function () {
+            registrarAuditoria("Excluiu a atividade " + idx);
+            anunciar("Atividade excluída");
+          });
+        });
       }
       var a = estado.at.filter(function (z) {
         return z.id === b.dataset.a;
       })[0];
       if (!a || !podeGerenciar(a)) return;
-      var m = a.membros.map(function (x, i) {
-        return i == b.dataset.i
-          ? {
-              nome: x.nome,
-              resp: x.resp,
-              feito: true,
-            }
-          : x;
+      var i = Number(b.dataset.i);
+      executarUmaVez("at-" + a.id, b, function () {
+        var m = a.membros.map(function (x, j) {
+          return j === i ? Object.assign({}, x, { feito: true }) : x;
+        });
+        return Dados.upd("atividades", a.id, { membros: m }).then(function () {
+          registrarAuditoria(
+            "Marcou a parte de " + a.membros[i].nome + " como concluída em " + a.id,
+          );
+          anunciar("Parte marcada como concluída");
+        });
       });
-      Dados.upd("atividades", a.id, {
-        membros: m,
-      });
-      registrarAuditoria(
-        "Marcou a parte de " + a.membros[b.dataset.i].nome + " como concluída em " + a.id,
-      );
-      anunciar("Parte marcada como concluída");
     };
   });
 }
@@ -711,20 +1358,39 @@ function botaoDeAcao(id, s, t, tt, pri) {
     "</button> "
   );
 }
-function filaDeAtendimento() {
-  return estado.ch
-    .filter(function (a) {
-      return a.status === "confirmado" || a.status === "atendimento";
-    })
-    .sort(function (a, b) {
-      return (a.confirmadoEm || 0) - (b.confirmadoEm || 0);
-    });
+// QoS: quem está em atendimento fica no topo; depois, menor peso de prioridade
+// (com envelhecimento a cada 30 min de espera) e, em empate, ordem de confirmação.
+function pesoQoS(a, agora) {
+  var p = PESO_PRIORIDADE[a.prio];
+  if (p == null) p = 1;
+  var espera = agora - (a.confirmadoEm || agora);
+  return Math.max(0, p - Math.floor(espera / ENVELHECIMENTO_MS));
 }
+function ordenarFila(lista) {
+  var agora = Date.now();
+  return lista.slice().sort(function (a, b) {
+    var ea = a.status === "atendimento" ? 0 : 1,
+      eb = b.status === "atendimento" ? 0 : 1;
+    return (
+      ea - eb ||
+      pesoQoS(a, agora) - pesoQoS(b, agora) ||
+      (a.confirmadoEm || 0) - (b.confirmadoEm || 0)
+    );
+  });
+}
+function filaDeAtendimento() {
+  return ordenarFila(
+    estado.ch.filter(function (a) {
+      return a.status === "confirmado" || a.status === "atendimento";
+    }),
+  );
+}
+var ultimoChamado = 0;
 function desenharChamados(p) {
   if (!porId("cl")) {
     p.innerHTML = ehTI()
       ? '<p class="hint">Modo vigilância: você vê todos os chamados, sem poder alterá-los.</p><div id="cl"></div>'
-      : '<h3>Pedir ajuda: abrir chamado</h3><div class="cols" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))"><div><label class="f" for="ctt">Título</label><input type="text" id="ctt"></div><div><label class="f" for="cct">Categoria</label><select id="cct">' +
+      : '<h3>Pedir ajuda: abrir chamado</h3><div class="cols" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))"><div><label class="f" for="ctt">Título</label><input type="text" id="ctt" maxlength="120"></div><div><label class="f" for="cct">Categoria</label><select id="cct">' +
         CATEGORIAS.map(function (c) {
           return "<option>" + c + "</option>";
         }).join("") +
@@ -732,8 +1398,8 @@ function desenharChamados(p) {
         PRIORIDADES.map(function (c, i) {
           return "<option" + (i === 1 ? " selected" : "") + ">" + c + "</option>";
         }).join("") +
-        '</select></div></div><label class="f" for="cds">Descrição do problema</label><textarea id="cds" rows="3"></textarea><div id="e"></div><div class="row"><button class="pri" id="addc">Abrir chamado</button>' +
-        (podeAdministrar() ? '<button id="seed">Carregar exemplos</button>' : "") +
+        '</select></div></div><label class="f" for="cds">Descrição do problema</label><textarea id="cds" rows="3" maxlength="2000"></textarea><div id="e"></div><div class="row"><button class="pri" id="addc">Abrir chamado</button>' +
+        (podeAdministrar() && !fb ? '<button id="seed">Carregar exemplos</button>' : "") +
         '</div><div id="cl"></div>';
     if (porId("addc"))
       porId("addc").onclick = function () {
@@ -743,12 +1409,12 @@ function desenharChamados(p) {
         if (t.length < 3) return mostrarErro("Digite um título para o chamado.", "ctt");
         if (d.length < 5)
           return mostrarErro("Descreva o problema para a equipe conseguir ajudar.", "cds");
-        estado.busy = true;
+        if (Date.now() - ultimoChamado < INTERVALO_CHAMADOS_MS)
+          return mostrarErro("Aguarde alguns segundos antes de abrir outro chamado.");
         var b = porId("addc");
-        b.disabled = true;
-        b.innerHTML = '<span class="spin" aria-hidden="true"></span> Enviando…';
+        ocupar(b, "Enviando…");
         var id = "CH-" + Date.now().toString(36).toUpperCase();
-        Dados.set("chamados", id, {
+        Dados.criarComLimite("chamados", id, {
           titulo: t,
           cat: porId("cct").value,
           prio: porId("cpr").value,
@@ -756,12 +1422,12 @@ function desenharChamados(p) {
           status: "pendente",
           criado: Date.now(),
           por: estado.user.nome,
+          porUid: estado.user.uid,
         })
           .then(function () {
+            ultimoChamado = Date.now();
             registrarAuditoria("Abriu o chamado " + id + " (" + t + ")");
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Abrir chamado";
+            liberar(b);
             porId("ctt").value = "";
             porId("cds").value = "";
             porId("e").innerHTML =
@@ -770,11 +1436,13 @@ function desenharChamados(p) {
               " aberto. Acompanhe o status abaixo.</p>";
             anunciar("Chamado aberto");
           })
-          .catch(function () {
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Abrir chamado";
-            mostrarErro("Não foi possível abrir o chamado. Tente novamente.");
+          .catch(function (e) {
+            liberar(b);
+            mostrarErro(
+              e && (e.code === "limite" || e.code === "permission-denied")
+                ? "Aguarde alguns segundos antes de abrir outro chamado."
+                : "Não foi possível abrir o chamado. Tente novamente.",
+            );
           });
       };
     if (porId("seed"))
@@ -792,28 +1460,33 @@ function desenharChamados(p) {
             status: "pendente",
             criado: Date.now() + i,
             por: x[1],
+            porUid: "ex-" + normalizar(x[1]),
           });
         });
         anunciar("Exemplos carregados");
       };
   }
   var h = "";
-  if (!podeAdministrar() && !ehTI()) {
+  if (ehFuncionario()) {
     var L = estado.ch
         .filter(function (a) {
-          return a.por === estado.user.nome;
+          return a.porUid === estado.user.uid;
         })
         .sort(function (a, b) {
           return b.criado - a.criado;
         }),
-      fila = filaDeAtendimento();
+      espera = ordenarFila(
+        estado.fila.filter(function (x) {
+          return x.status === "confirmado";
+        }),
+      );
     h =
       '<h3 style="margin-top:1rem">Meus chamados (' +
       L.length +
       ")</h3>" +
       (L.length
         ? L.map(function (a) {
-            var pos = fila.findIndex(function (x) {
+            var pos = espera.findIndex(function (x) {
               return x.id === a.id;
             });
             return (
@@ -840,7 +1513,7 @@ function desenharChamados(p) {
             );
           }).join("")
         : '<p class="hint">Você ainda não abriu chamados.</p>') +
-      '<p class="hint">Seu perfil só pede ajuda. Representantes e Gestores administram os chamados.</p>';
+      '<p class="hint">Seu perfil só pede ajuda. Representantes e Gestores administram os chamados. A fila prioriza chamados de prioridade Alta.</p>';
   } else {
     var ro = ehTI(),
       pend = estado.ch
@@ -848,7 +1521,9 @@ function desenharChamados(p) {
           return a.status === "pendente";
         })
         .sort(function (a, b) {
-          return a.criado - b.criado;
+          return (
+            (PESO_PRIORIDADE[a.prio] || 0) - (PESO_PRIORIDADE[b.prio] || 0) || a.criado - b.criado
+          );
         }),
       fl = filaDeAtendimento(),
       enc = estado.ch.filter(function (a) {
@@ -859,7 +1534,7 @@ function desenharChamados(p) {
       fl.length +
       ")</h3>" +
       (fl.length
-        ? '<div class="tw"><table><caption class="hint" style="text-align:left">Ordem de confirmação: o primeiro é o próximo a ser atendido</caption><thead><tr><th>Nº</th><th>Chamado</th><th>Aberto por</th><th>Status</th>' +
+        ? '<div class="tw"><table><caption class="hint" style="text-align:left">Ordem QoS: prioridade Alta primeiro; na mesma prioridade, ordem de confirmação. A cada 30 min de espera o chamado sobe um nível.</caption><thead><tr><th>Nº</th><th>Chamado</th><th>Aberto por</th><th>Status</th>' +
           (ro ? "" : "<th>Ação</th>") +
           "</tr></thead><tbody>" +
           fl
@@ -958,28 +1633,58 @@ function desenharChamados(p) {
   [].forEach.call(porId("cl").querySelectorAll("button[data-s]"), function (b) {
     b.onclick = function () {
       if (!podeAdministrar()) return;
-      var up = {
-        status: b.dataset.s,
-      };
-      if (up.status === "confirmado") up.confirmadoEm = Date.now();
-      if (up.status === "atendimento") up.atendente = estado.user.nome;
-      Dados.upd("chamados", b.dataset.id, up);
-      registrarAuditoria(
-        "Chamado " +
-          b.dataset.id +
-          ": " +
-          {
-            confirmado: "confirmou (entrou na fila)",
-            atendimento: "chamou para atendimento",
-            atendido: "concluiu",
-            cancelado: "cancelou",
-          }[up.status],
-      );
-      anunciar(
-        up.status === "confirmado"
-          ? "Chamado adicionado à fila de atendimento"
-          : "Status atualizado",
-      );
+      var id = b.dataset.id,
+        st = b.dataset.s,
+        c = estado.ch.filter(function (x) {
+          return x.id === id;
+        })[0];
+      if (!c) return;
+      executarUmaVez("ch-" + id, b, function () {
+        // A coleção "fila" guarda só prioridade/horário/status (sem dados pessoais),
+        // para o funcionário saber a posição sem poder ler chamados de outras pessoas.
+        var up = { status: st },
+          ops;
+        if (st === "confirmado") {
+          up.confirmadoEm = Date.now();
+          ops = [
+            ["upd", "chamados", id, up],
+            ["set", "fila", id, { prio: c.prio, confirmadoEm: up.confirmadoEm, status: st }],
+          ];
+        } else if (st === "atendimento") {
+          up.atendente = estado.user.nome;
+          up.atendenteUid = estado.user.uid;
+          ops = [
+            ["upd", "chamados", id, up],
+            [
+              "merge",
+              "fila",
+              id,
+              { prio: c.prio, confirmadoEm: c.confirmadoEm || Date.now(), status: st },
+            ],
+          ];
+        } else {
+          ops = [
+            ["upd", "chamados", id, up],
+            ["del", "fila", id],
+          ];
+        }
+        return Dados.lote(ops).then(function () {
+          registrarAuditoria(
+            "Chamado " +
+              id +
+              ": " +
+              {
+                confirmado: "confirmou (entrou na fila)",
+                atendimento: "chamou para atendimento",
+                atendido: "concluiu",
+                cancelado: "cancelou",
+              }[st],
+          );
+          anunciar(
+            st === "confirmado" ? "Chamado adicionado à fila de atendimento" : "Status atualizado",
+          );
+        });
+      });
     };
   });
 }
@@ -989,7 +1694,7 @@ function desenharMural(p) {
   if (!porId("pl")) {
     p.innerHTML =
       (podeAdministrar()
-        ? '<h3>Novo comunicado</h3><label class="f" for="ptx">Mensagem</label><textarea id="ptx" rows="3"></textarea><div class="chk"><input type="checkbox" id="pim"><label for="pim">Marcar como importante</label></div><div id="e"></div><div class="row"><button class="pri" id="addp">Publicar</button></div>'
+        ? '<h3>Novo comunicado</h3><label class="f" for="ptx">Mensagem</label><textarea id="ptx" rows="3" maxlength="2000"></textarea><div class="chk"><input type="checkbox" id="pim"><label for="pim">Marcar como importante</label></div><div id="e"></div><div class="row"><button class="pri" id="addp">Publicar</button></div>'
         : '<p class="hint">Somente Representantes e Gestores publicam comunicados.</p>') +
       '<div id="pl"></div>';
     if (porId("addp"))
@@ -997,30 +1702,25 @@ function desenharMural(p) {
         if (estado.busy) return;
         var t = porId("ptx").value.trim();
         if (t.length < 3) return mostrarErro("Escreva a mensagem do comunicado.", "ptx");
-        estado.busy = true;
         var b = porId("addp");
-        b.disabled = true;
-        b.innerHTML = '<span class="spin" aria-hidden="true"></span> Publicando…';
+        ocupar(b, "Publicando…");
         Dados.set("posts", gerarId(), {
           texto: t,
           imp: porId("pim").checked,
           autor: estado.user.nome,
+          autorUid: estado.user.uid,
           criado: Date.now(),
         })
           .then(function () {
             registrarAuditoria("Publicou um comunicado");
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Publicar";
+            liberar(b);
             porId("ptx").value = "";
             porId("pim").checked = false;
             porId("e").innerHTML = "";
             anunciar("Comunicado publicado");
           })
           .catch(function () {
-            estado.busy = false;
-            b.disabled = false;
-            b.textContent = "Publicar";
+            liberar(b);
             mostrarErro("Não foi possível publicar.");
           });
       };
@@ -1057,8 +1757,9 @@ function desenharDocumentos(p) {
       return (
         '<li><span class="' +
         (ok ? "" : "lock") +
-        '">' +
+        '"><span aria-hidden="true">' +
         (ok ? "📄 " : "🔒 ") +
+        "</span>" +
         escaparHtml(d.n) +
         (ok ? "" : " (requer perfil " + NIVEL_DESCRICAO[d.lv] + ")") +
         "</span>" +
@@ -1083,13 +1784,15 @@ function desenharDocumentos(p) {
   });
 }
 
-/* ---- dados em tempo real, login e eventos ---- */
+/* ===== 7. DADOS EM TEMPO REAL, LOGIN E EVENTOS ===== */
 var ABAS_AFETADAS = {
     chamados: ["chamados", "monitor"],
     atividades: ["atividades", "monitor"],
     posts: ["mural"],
-    usuarios: ["atividades", "monitor"],
+    usuarios: ["atividades", "monitor", "equipe"],
     auditoria: ["monitor"],
+    chaves: ["monitor"],
+    fila: ["chamados"],
   },
   CHAVE_DO_ESTADO = {
     chamados: "ch",
@@ -1097,73 +1800,177 @@ var ABAS_AFETADAS = {
     posts: "posts",
     usuarios: "us",
     auditoria: "au",
+    chaves: "chaves",
+    fila: "fila",
   };
+// Cada perfil assina só o que as Regras do Firestore permitem ler.
 function assinarDados() {
   estado.unsubs.forEach(function (u) {
     u && u();
   });
   estado.unsubs = [];
-  COLECOES.forEach(function (n) {
-    if (n === "auditoria" && !ehTI()) return;
+  var uid = estado.user.uid,
+    func = ehFuncionario(),
+    plano = [
+      ["chamados", func ? ["porUid", "==", uid] : null],
+      ["atividades", func ? ["membrosUids", "array-contains", uid] : null],
+      ["posts", null],
+    ];
+  if (func) plano.push(["fila", null]);
+  else plano.push(["usuarios", null]);
+  if (ehTI()) plano.push(["auditoria", null], ["chaves", null]);
+  plano.forEach(function (x) {
+    var n = x[0];
     estado.unsubs.push(
-      Dados.sub(n, function (l) {
-        estado[CHAVE_DO_ESTADO[n]] = l;
-        if (estado.user && ABAS_AFETADAS[n].indexOf(estado.tab) >= 0) desenharAbaAtual();
-      }),
+      Dados.sub(
+        n,
+        function (l) {
+          estado[CHAVE_DO_ESTADO[n]] = l;
+          if (estado.user && ABAS_AFETADAS[n].indexOf(estado.tab) >= 0) desenharAbaAtual();
+        },
+        x[1],
+      ),
     );
   });
 }
+function aoEnviarLogin() {
+  if (estado.busy) return;
+  var cad = estado.cadastro,
+    email = normalizar(porId("em").value),
+    senha = porId("pw").value,
+    nome = cad ? porId("nm").value.trim() : "";
+  if (cad && nome.length < 2) return mostrarErro("Digite seu nome.", "nm");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    return mostrarErro("Digite um e-mail válido.", "em");
+  if (cad) {
+    if (senha.length < 8 || !/[A-Za-z]/.test(senha) || !/\d/.test(senha))
+      return mostrarErro("A senha precisa ter pelo menos 8 caracteres, com letras e números.", "pw");
+    if (senha !== porId("pw2").value) return mostrarErro("As senhas não conferem.", "pw2");
+  } else if (!senha) return mostrarErro("Digite sua senha.", "pw");
+  var perfilLocal = cad && !NUVEM_CONFIGURADA ? porId("pf").value : null,
+    b = porId("l1");
+  ocupar(b, cad ? "Criando conta…" : "Verificando…");
+  firebasePronto
+    .then(function () {
+      if (NUVEM_CONFIGURADA && !fb) throw { code: "sem-nuvem" };
+      return cad ? Autenticacao.cadastrar(email, senha) : Autenticacao.entrar(email, senha);
+    })
+    .then(function (c) {
+      return Dados.get("usuarios", c.uid).then(function (doc) {
+        estado.tmp = {
+          uid: c.uid,
+          email: c.email,
+          nome: doc ? doc.nome : nome || c.email.split("@")[0],
+          perfil: doc ? doc.perfil : perfilLocal || "func",
+          novo: !doc,
+        };
+        Cripto.preparar(c.uid); // gera/carrega as chaves RSA enquanto o usuário digita o MFA
+        iniciarMFA();
+        estado.busy = false;
+        estado.auth = 1;
+        ultimaAtividade = Date.now();
+        desenharTela();
+      });
+    })
+    .catch(function (e) {
+      console.warn(e);
+      liberar(b);
+      if (fb && fb.auth.currentUser) Autenticacao.sair();
+      mostrarErro(mensagemErroAuth(e));
+    });
+}
+function aoVerificarMFA() {
+  if (estado.busy) return;
+  var m = estado.mfa,
+    v = porId("cd").value.trim();
+  if (!/^\d{6}$/.test(v)) return mostrarErro("Digite os 6 dígitos do código.", "cd");
+  if (Date.now() > m.expira) return mostrarErro("O código expirou. Peça um novo código.", "nv");
+  if (v !== m.codigo) {
+    m.tentativas++;
+    registrarAuditoria(
+      "Falha de MFA (código incorreto, tentativa " + m.tentativas + " de " + MFA_MAX_TENTATIVAS + ")",
+    );
+    if (m.tentativas >= MFA_MAX_TENTATIVAS) {
+      estado.busy = true;
+      return registrarAuditoria("Login bloqueado: excesso de tentativas de MFA").then(function () {
+        return encerrarSessao("Muitas tentativas incorretas. Por segurança, faça login novamente.");
+      });
+    }
+    porId("cd").value = "";
+    return mostrarErro(
+      "Código incorreto. Restam " + (MFA_MAX_TENTATIVAS - m.tentativas) + " tentativa(s).",
+      "cd",
+    );
+  }
+  var u = estado.tmp,
+    b = porId("l2");
+  ocupar(b, "Entrando…");
+  var p = u.novo
+    ? Dados.set("usuarios", u.uid, {
+        nome: u.nome,
+        email: u.email,
+        perfil: u.perfil,
+        ultimo: Date.now(),
+      })
+    : Dados.upd("usuarios", u.uid, { ultimo: Date.now() });
+  p.then(function () {
+    pararContagemMFA();
+    estado.user = { uid: u.uid, nome: u.nome, email: u.email, perfil: u.perfil };
+    estado.tmp = null;
+    estado.mfa = null;
+    estado.auth = 0;
+    estado.busy = false;
+    estado.tab = ehTI() ? "monitor" : "atividades";
+    registrarAuditoria("Login realizado (senha + MFA)");
+    assinarDados();
+    desenharTela();
+    anunciar("Login realizado como " + NOME_DO_PERFIL[estado.user.perfil]);
+  }).catch(function (e) {
+    console.warn(e);
+    liberar(b);
+    mostrarErro("Não foi possível concluir o login. Tente novamente.");
+  });
+}
 function ligarEventos() {
-  if (porId("l1"))
-    porId("l1").onclick = function () {
-      var n = porId("nm").value.trim();
-      if (n.length < 2) return mostrarErro("Digite seu nome.", "nm");
-      if (porId("pw").value.length < 3)
-        return mostrarErro("Digite a senha (qualquer valor na demonstração).", "pw");
-      estado.tmp = {
-        nome: n,
-        perfil: porId("pf").value,
-      };
-      estado.auth = 1;
+  if (porId("flogin"))
+    porId("flogin").onsubmit = function (ev) {
+      ev.preventDefault();
+      aoEnviarLogin();
+    };
+  if (porId("alt"))
+    porId("alt").onclick = function () {
+      estado.cadastro = !estado.cadastro;
       desenharTela();
+    };
+  if (porId("fmfa"))
+    porId("fmfa").onsubmit = function (ev) {
+      ev.preventDefault();
+      aoVerificarMFA();
     };
   if (porId("l0"))
     porId("l0").onclick = function () {
-      estado.auth = 0;
-      desenharTela();
+      encerrarSessao();
     };
-  if (porId("l2"))
-    porId("l2").onclick = function () {
-      if (porId("cd").value.trim() !== CODIGO_MFA) {
-        registrarAuditoria("Falha de MFA (código incorreto)");
-        return mostrarErro("Código incorreto. Tente novamente.", "cd");
+  if (porId("nv"))
+    porId("nv").onclick = function () {
+      var m = estado.mfa;
+      if (m.envios >= MFA_MAX_ENVIOS) {
+        return registrarAuditoria("Login bloqueado: limite de reenvios de MFA").then(function () {
+          return encerrarSessao("Limite de reenvios atingido. Faça login novamente.");
+        });
       }
-      estado.user = estado.tmp;
-      estado.auth = 0;
-      estado.tab = ehTI() ? "monitor" : "atividades";
-      Dados.set("usuarios", normalizar(estado.user.nome), {
-        nome: estado.user.nome,
-        perfil: estado.user.perfil,
-        ultimo: Date.now(),
-      });
-      registrarAuditoria("Login realizado");
-      assinarDados();
+      m.codigo = gerarCodigoMFA();
+      m.expira = Date.now() + MFA_VALIDADE_MS;
+      m.envios++;
       desenharTela();
-      anunciar("Login realizado como " + NOME_DO_PERFIL[estado.user.perfil]);
+      anunciar("Novo código enviado");
     };
   if (porId("out"))
     porId("out").onclick = function () {
-      registrarAuditoria("Logout");
-      estado.unsubs.forEach(function (u) {
-        u && u();
+      this.disabled = true;
+      registrarAuditoria("Logout").then(function () {
+        encerrarSessao();
       });
-      estado.unsubs = [];
-      estado.user = null;
-      estado.ch = [];
-      estado.at = [];
-      estado.us = [];
-      estado.au = [];
-      desenharTela();
     };
   [].forEach.call(document.querySelectorAll('[role="tab"]'), function (b, i, all) {
     b.onclick = function () {
@@ -1174,13 +1981,24 @@ function ligarEventos() {
     };
     b.onkeydown = function (e) {
       var k = e.key,
-        j = k === "ArrowRight" ? i + 1 : k === "ArrowLeft" ? i - 1 : -1;
-      if (j < 0) return;
+        j =
+          k === "ArrowRight"
+            ? i + 1
+            : k === "ArrowLeft"
+              ? i - 1
+              : k === "Home"
+                ? 0
+                : k === "End"
+                  ? all.length - 1
+                  : -1;
+      if (j < 0 && k !== "ArrowLeft") return;
       e.preventDefault();
       all[(j + all.length) % all.length].click();
     };
   });
 }
+
+/* ---- acessibilidade ---- */
 porId("fp").onclick = function () {
   mudarFonte(2);
 };
@@ -1198,74 +2016,62 @@ porId("ct").onclick = function () {
   else document.documentElement.removeAttribute("data-contrast");
   this.setAttribute("aria-pressed", on);
 };
-porId("lt").onclick = function () {
-  var on = !document.documentElement.classList.contains("lite");
+
+/* ---- modo leve (manual ou automático em rede lenta) ---- */
+var modoLeveManual = false;
+function aplicarModoLeve(on, mensagem) {
   document.documentElement.classList.toggle("lite", on);
-  this.setAttribute("aria-pressed", on);
-  anunciar(on ? "Modo leve ativado" : "Modo leve desativado");
+  porId("lt").setAttribute("aria-pressed", on);
+  if (mensagem) anunciar(mensagem);
+}
+porId("lt").onclick = function () {
+  modoLeveManual = true;
+  var on = !document.documentElement.classList.contains("lite");
+  aplicarModoLeve(on, on ? "Modo leve ativado" : "Modo leve desativado");
 };
+function avaliarRede() {
+  var r = infoRede();
+  if (r && !modoLeveManual) {
+    var lenta = r.economia || r.tipo === "slow-2g" || r.tipo === "2g",
+      ativo = document.documentElement.classList.contains("lite");
+    if (lenta !== ativo)
+      aplicarModoLeve(
+        lenta,
+        lenta ? "Rede lenta detectada: modo leve ativado automaticamente" : "",
+      );
+  }
+  if (estado.user && estado.tab === "monitor") agendarRedesenho();
+}
+var conexao = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+if (conexao && conexao.addEventListener) conexao.addEventListener("change", avaliarRede);
+
+/* ---- sessão: encerra após inatividade ---- */
+var ultimaAtividade = Date.now();
+["click", "keydown", "pointerdown", "touchstart"].forEach(function (ev) {
+  document.addEventListener(
+    ev,
+    function () {
+      ultimaAtividade = Date.now();
+    },
+    { passive: true },
+  );
+});
+setInterval(function () {
+  if ((estado.user || estado.auth === 1) && Date.now() - ultimaAtividade > LIMITE_INATIVIDADE_MS) {
+    ultimaAtividade = Date.now();
+    registrarAuditoria("Sessão encerrada por inatividade").then(function () {
+      encerrarSessao("Sua sessão foi encerrada após 15 minutos sem atividade.");
+    });
+  }
+}, 30000);
+
+/* ---- conexão ---- */
 function verificarConexao() {
   porId("net").hidden = navigator.onLine;
+  if (estado.user && estado.tab === "monitor") agendarRedesenho();
 }
 window.addEventListener("online", verificarConexao);
 window.addEventListener("offline", verificarConexao);
 verificarConexao();
+avaliarRede();
 desenharTela();
-/* ===== FIREBASE (Firestore) ===== */
-var firebaseConfig = {
-  apiKey: "AIzaSyDjf9H-XARaa6Ey_FqvuPMpnhXN5WHS0kw",
-  authDomain: "organizacao-ambu.firebaseapp.com",
-  projectId: "organizacao-ambu",
-  storageBucket: "organizacao-ambu.firebasestorage.app",
-  messagingSenderId: "524269015365",
-  appId: "1:524269015365:web:33e75fe0a5fa44fd65ee2c",
-};
-(function () {
-  var base = "https://www.gstatic.com/firebasejs/10.14.1/";
-  Promise.all([import(base + "firebase-app.js"), import(base + "firebase-firestore.js")])
-    .then(function (m) {
-      var app = m[0].initializeApp(firebaseConfig),
-        fs = m[1].getFirestore(app),
-        F = m[1];
-      banco = {
-        collection: function (n) {
-          return {
-            doc: function (id) {
-              return {
-                set: function (d) {
-                  return F.setDoc(F.doc(fs, n, id), d);
-                },
-                update: function (d) {
-                  return F.updateDoc(F.doc(fs, n, id), d);
-                },
-                delete: function () {
-                  return F.deleteDoc(F.doc(fs, n, id));
-                },
-              };
-            },
-            onSnapshot: function (next, error) {
-              return F.onSnapshot(
-                F.collection(fs, n),
-                function (snap) {
-                  next({
-                    docs: snap.docs.map(function (d) {
-                      return {
-                        id: d.id,
-                        data: function () {
-                          return d.data();
-                        },
-                      };
-                    }),
-                  });
-                },
-                error,
-              );
-            },
-          };
-        },
-      };
-    })
-    .catch(function (e) {
-      console.warn("Firebase indisponível, usando modo local.", e);
-    });
-})();

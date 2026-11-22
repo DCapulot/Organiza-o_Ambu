@@ -38,3 +38,12 @@ ul.docs li{display:flex;justify-content:space-between;align-items:center;gap:.5r
 @keyframes s{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.spin{animation:none}}
 .lite .spin{animation:none}
+.sr{position:absolute;left:-999px;width:1px;height:1px;overflow:hidden}
+.tw{overflow-x:auto;margin-top:.5rem}
+table{border-collapse:collapse;width:100%;min-width:520px}
+th,td{border-bottom:1px solid var(--bd);padding:.45rem;text-align:left;vertical-align:top}
+th{font-weight:700}
+.link{background:none;border:0;color:var(--pri);text-decoration:underline;padding:.3rem 0;min-height:44px}
+.mfa{border:2px dashed var(--bd);border-radius:12px;padding:.7rem;margin:.6rem 0;background:var(--bg)}
+.mfa .cod{font-size:1.5rem;font-weight:700;letter-spacing:.2em}
+.ok{color:var(--ok);font-weight:700}.bad{color:var(--bad);font-weight:700}
