@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WorkLink</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Pular para o conteúdo</a>
+<div class="wrap">
+<header>
+ <h1>🔗 WorkLink</h1>
+ <div class="tools" role="group" aria-label="Opções de acessibilidade e desempenho">
+  <button id="fm" class="sm" aria-label="Diminuir fonte">A−</button>
+  <button id="fp" class="sm" aria-label="Aumentar fonte">A+</button>
+  <button id="ct" class="sm" aria-pressed="false">Alto contraste</button>
+  <button id="lt" class="sm" aria-pressed="false">Modo leve</button>
+ </div>
+</header>
+<p id="net" class="err" role="status" hidden>Sem conexão. Verifique sua internet; as alterações serão enviadas quando voltar.</p>
+<main id="main" tabindex="-1"><div id="v"></div>
+<p class="hint">Protótipo de demonstração: use dados fictícios. Tab navega, Enter confirma.</p></main>
+<p id="live" role="status" aria-live="polite" style="position:absolute;left:-999px"></p>
+</div>
+<script src="script.js"></script>
+</body>
+</html>
