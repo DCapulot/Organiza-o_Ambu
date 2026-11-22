@@ -166,6 +166,36 @@ function confirmarClique(b, textoConfirmar) {
   );
   return false;
 }
+// Preserva o foco do teclado (e o estado de <details>) quando uma área é redesenhada em tempo real.
+function seletorDoElemento(el) {
+  if (!el || el === document.body) return null;
+  if (el.id) return "#" + el.id;
+  if (el.dataset && el.dataset.u) return 'button[data-u="' + el.dataset.u + '"]';
+  if (el.dataset && el.dataset.id && el.dataset.s)
+    return 'button[data-id="' + el.dataset.id + '"][data-s="' + el.dataset.s + '"]';
+  if (el.dataset && el.dataset.a && el.dataset.i)
+    return 'button[data-a="' + el.dataset.a + '"][data-i="' + el.dataset.i + '"]';
+  if (el.dataset && el.dataset.x) return 'button[data-x="' + el.dataset.x + '"]';
+  if (el.tagName === "SUMMARY") return "details > summary";
+  return null;
+}
+function comFocoPreservado(container, fn) {
+  var ativo = document.activeElement,
+    estavaDentro = container && ativo && container.contains(ativo),
+    sel = estavaDentro ? seletorDoElemento(ativo) : null,
+    det = container && container.querySelector("details"),
+    detAberto = !!(det && det.open);
+  fn();
+  if (detAberto) {
+    var novoDet = container.querySelector("details");
+    if (novoDet) novoDet.open = true;
+  }
+  if (estavaDentro) {
+    var alvo = sel ? container.querySelector(sel) : null;
+    if (alvo && !alvo.disabled) alvo.focus();
+    else if (porId("pn")) porId("pn").focus();
+  }
+}
 var temporizadorAviso = null;
 function avisar(m) {
   var a = porId("aviso");
@@ -903,8 +933,9 @@ function desenharMonitoramento(p) {
         )
       : null,
     carga = tempoDeCarregamento();
-  p.innerHTML =
-    '<h3>Visão geral do sistema (somente leitura)</h3><div class="cols">' +
+  comFocoPreservado(p, function () {
+    p.innerHTML =
+      '<h3>Visão geral do sistema (somente leitura)</h3><div class="cols">' +
     '<section class="col" aria-label="Rede e QoS"><h3>Rede e QoS</h3><p>Conexão: <strong>' +
     (navigator.onLine ? "online" : "offline") +
     "</strong><br>" +
@@ -1003,6 +1034,7 @@ function desenharMonitoramento(p) {
         }).join("") +
         "</tbody></table></div>"
       : '<p class="hint">Nenhum evento registrado ainda.</p>');
+  });
 }
 
 /* ---- equipe (somente Gestor altera perfis) ---- */
@@ -1010,8 +1042,9 @@ function desenharEquipe(p) {
   var L = estado.us.slice().sort(function (a, b) {
     return String(a.nome).localeCompare(String(b.nome));
   });
-  p.innerHTML =
-    '<h3>Equipe e perfis de acesso</h3><p class="hint">Novos cadastros entram como Funcionário. Somente o Gestor altera perfis; a mesma regra é aplicada no servidor pelas Regras do Firestore.</p>' +
+  comFocoPreservado(p, function () {
+    p.innerHTML =
+      '<h3>Equipe e perfis de acesso</h3><p class="hint">Novos cadastros entram como Funcionário. Somente o Gestor altera perfis; a mesma regra é aplicada no servidor pelas Regras do Firestore.</p>' +
     (L.length
       ? '<div class="tw"><table><thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Ação</th></tr></thead><tbody>' +
         L.map(function (u) {
@@ -1070,6 +1103,7 @@ function desenharEquipe(p) {
         });
       });
     };
+  });
   });
 }
 
@@ -1135,7 +1169,7 @@ function desenharAtividades(p) {
         : "Seu perfil é de consulta: você vê as atividades em que foi indicado.";
     p.innerHTML =
       (podeAdministrar()
-        ? "<h3>Nova atividade para uma equipe</h3>" +
+        ? '<h3>Nova atividade para uma equipe</h3><form id="fat" novalidate>' +
           (ehRepresentante()
             ? '<p class="hint">Como Representante, você atribui atividades somente a funcionários comuns.</p>'
             : "") +
@@ -1144,11 +1178,11 @@ function desenharAtividades(p) {
           '"></div></div><label class="f" for="atr">Requisitos de entrega</label><textarea id="atr" rows="2" placeholder="O que precisa estar pronto para a atividade ser aceita"></textarea><fieldset style="border:0;padding:0;margin:.8rem 0 0"><legend class="f">Membros e responsabilidades</legend><div id="mrows">' +
           linhaDeMembro() +
           linhaDeMembro() +
-          '</div><div class="row"><button class="sm" id="addm">+ Adicionar membro</button>' +
+          '</div><div class="row"><button type="button" class="sm" id="addm">+ Adicionar membro</button>' +
           (fb
             ? ""
-            : '<button class="sm" id="seedu">Carregar funcionários de exemplo</button>') +
-          '</div><p class="hint">Só aparecem pessoas que já criaram conta no WorkLink.</p></fieldset><div id="e"></div><div class="row"><button class="pri" id="adda">Criar atividade</button></div>'
+            : '<button type="button" class="sm" id="seedu">Carregar funcionários de exemplo</button>') +
+          '</div><p class="hint">Só aparecem pessoas que já criaram conta no WorkLink.</p></fieldset><div id="e"></div><div class="row"><button type="submit" class="pri" id="adda">Criar atividade</button></div></form>'
         : '<p class="hint">' + hint + "</p>") + '<div id="al"></div>';
     if (porId("addm"))
       porId("addm").onclick = function () {
@@ -1173,8 +1207,9 @@ function desenharAtividades(p) {
         });
         anunciar("Funcionários de exemplo carregados");
       };
-    if (porId("adda"))
-      porId("adda").onclick = function () {
+    if (porId("fat"))
+      porId("fat").onsubmit = function (ev) {
+        ev.preventDefault();
         if (estado.busy) return;
         var t = porId("atl").value.trim(),
           eq = porId("ate").value.trim(),
@@ -1247,8 +1282,9 @@ function desenharAtividades(p) {
   var L = estado.at.filter(atividadeVisivel).sort(function (a, b) {
     return (a.prazo || "9").localeCompare(b.prazo || "9");
   });
-  porId("al").innerHTML =
-    '<h3 style="margin-top:1rem">' +
+  comFocoPreservado(porId("al"), function () {
+    porId("al").innerHTML =
+      '<h3 style="margin-top:1rem">' +
     (ehGestor() || ehTI()
       ? "Atividades das equipes"
       : podeAdministrar()
@@ -1365,6 +1401,7 @@ function desenharAtividades(p) {
       });
     };
   });
+  });
 }
 
 /* ---- chamados ---- */
@@ -1432,7 +1469,7 @@ function desenharChamados(p) {
   if (!porId("cl")) {
     p.innerHTML = ehTI()
       ? '<p class="hint">Modo vigilância: você vê todos os chamados, sem poder alterá-los.</p><div id="cl"></div>'
-      : '<h3>Pedir ajuda: abrir chamado</h3><div class="cols" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))"><div><label class="f" for="ctt">Título</label><input type="text" id="ctt" maxlength="120"></div><div><label class="f" for="cct">Categoria</label><select id="cct">' +
+      : '<h3>Pedir ajuda: abrir chamado</h3><form id="fch" novalidate><div class="cols" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr))"><div><label class="f" for="ctt">Título</label><input type="text" id="ctt" maxlength="120"></div><div><label class="f" for="cct">Categoria</label><select id="cct">' +
         CATEGORIAS.map(function (c) {
           return "<option>" + c + "</option>";
         }).join("") +
@@ -1440,11 +1477,12 @@ function desenharChamados(p) {
         PRIORIDADES.map(function (c, i) {
           return "<option" + (i === 1 ? " selected" : "") + ">" + c + "</option>";
         }).join("") +
-        '</select></div></div><label class="f" for="cds">Descrição do problema</label><textarea id="cds" rows="3" maxlength="2000"></textarea><div id="e"></div><div class="row"><button class="pri" id="addc">Abrir chamado</button>' +
-        (podeAdministrar() && !fb ? '<button id="seed">Carregar exemplos</button>' : "") +
-        '</div><div id="cl"></div>';
-    if (porId("addc"))
-      porId("addc").onclick = function () {
+        '</select></div></div><label class="f" for="cds">Descrição do problema</label><textarea id="cds" rows="3" maxlength="2000"></textarea><div id="e"></div><div class="row"><button type="submit" class="pri" id="addc">Abrir chamado</button>' +
+        (podeAdministrar() && !fb ? '<button type="button" id="seed">Carregar exemplos</button>' : "") +
+        '</div></form><div id="cl"></div>';
+    if (porId("fch"))
+      porId("fch").onsubmit = function (ev) {
+        ev.preventDefault();
         if (estado.busy) return;
         var t = porId("ctt").value.trim(),
           d = porId("cds").value.trim();
@@ -1671,8 +1709,9 @@ function desenharChamados(p) {
           .join("") +
         "</ul>";
   }
-  porId("cl").innerHTML = h;
-  [].forEach.call(porId("cl").querySelectorAll("button[data-s]"), function (b) {
+  comFocoPreservado(porId("cl"), function () {
+    porId("cl").innerHTML = h;
+    [].forEach.call(porId("cl").querySelectorAll("button[data-s]"), function (b) {
     b.onclick = function () {
       if (!podeAdministrar()) return;
       var id = b.dataset.id,
@@ -1730,6 +1769,7 @@ function desenharChamados(p) {
       });
     };
   });
+  });
 }
 
 /* ---- mural e documentos ---- */
@@ -1737,11 +1777,12 @@ function desenharMural(p) {
   if (!porId("pl")) {
     p.innerHTML =
       (podeAdministrar()
-        ? '<h3>Novo comunicado</h3><label class="f" for="ptx">Mensagem</label><textarea id="ptx" rows="3" maxlength="2000"></textarea><div class="chk"><input type="checkbox" id="pim"><label for="pim">Marcar como importante</label></div><div id="e"></div><div class="row"><button class="pri" id="addp">Publicar</button></div>'
+        ? '<h3>Novo comunicado</h3><form id="fmu" novalidate><label class="f" for="ptx">Mensagem</label><textarea id="ptx" rows="3" maxlength="2000"></textarea><div class="chk"><input type="checkbox" id="pim"><label for="pim">Marcar como importante</label></div><div id="e"></div><div class="row"><button type="submit" class="pri" id="addp">Publicar</button></div></form>'
         : '<p class="hint">Somente Representantes e Gestores publicam comunicados.</p>') +
       '<div id="pl"></div>';
-    if (porId("addp"))
-      porId("addp").onclick = function () {
+    if (porId("fmu"))
+      porId("fmu").onsubmit = function (ev) {
+        ev.preventDefault();
         if (estado.busy) return;
         var t = porId("ptx").value.trim();
         if (t.length < 3) return mostrarErro("Escreva a mensagem do comunicado.", "ptx");
