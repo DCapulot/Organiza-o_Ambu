@@ -1,5 +1,7 @@
 # WorkLink
 
+slide : https://docs.google.com/presentation/d/1DQjLOmNzjtdXaIMosOSyfrJdJM64f5M8p79ELytRVQs/edit?usp=sharing
+
 Plataforma corporativa de gestão e comunicação remota (WCAG 2.1): login com e-mail/senha (Firebase Authentication) e verificação em duas etapas (MFA), abertura e administração de chamados com fila de atendimento priorizada (QoS), atividades por equipe, mural de comunicados, central de documentos e painel de monitoramento com auditoria assinada digitalmente (RSA-PSS).
 
 Projeto Prático (2º Trabalho) de Desenvolvimento de Soluções Remotas.
