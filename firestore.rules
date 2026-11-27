@@ -1,14 +1,8 @@
 rules_version = '2';
 
-// Regras de segurança do WorkLink (Cloud Firestore).
-// Funcionam como o "firewall de aplicação": toda leitura e gravação é checada no servidor,
-// independentemente do que o navegador envie. Copie este arquivo em
-// Firebase Console > Firestore Database > Regras e clique em Publicar.
-
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ---------- funções auxiliares ----------
     function logado() {
       return request.auth != null;
     }
@@ -31,17 +25,16 @@ service cloud.firestore {
       return v is string && v.size() > 0 && v.size() <= max;
     }
 
-    // ---------- usuários e perfis ----------
     match /usuarios/{uid} {
-      // Cada um lê o próprio cadastro; Representante, Gestor e TI leem a equipe.
+
       allow read: if logado() && (request.auth.uid == uid || eh(['diamante', 'gestor', 'ti']));
-      // Cadastro próprio, sempre como Funcionário e com o e-mail da conta autenticada.
+
       allow create: if logado() && request.auth.uid == uid
         && request.resource.data.keys().hasOnly(['nome', 'email', 'perfil', 'ultimo'])
         && request.resource.data.perfil == 'func'
         && request.resource.data.email == request.auth.token.email
         && textoAte(request.resource.data.nome, 80);
-      // O usuário só altera nome e último acesso; só o Gestor altera o perfil de OUTRA pessoa.
+
       allow update: if logado() && (
         (request.auth.uid == uid && soMudou(['nome', 'ultimo']))
         || (eh(['gestor']) && request.auth.uid != uid && soMudou(['perfil'])
@@ -50,12 +43,10 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // ---------- chamados ----------
     match /chamados/{id} {
       allow read: if eh(['diamante', 'gestor', 'ti'])
         || (logado() && resource.data.porUid == request.auth.uid);
-      // Qualquer usuário autenticado abre chamado em seu próprio nome, sempre "pendente",
-      // e somente junto com a atualização de /limites (máx. 1 chamado a cada 10 s).
+
       allow create: if logado()
         && request.resource.data.keys().hasOnly(['titulo', 'cat', 'prio', 'desc', 'status', 'criado', 'por', 'porUid'])
         && request.resource.data.porUid == request.auth.uid
@@ -64,14 +55,13 @@ service cloud.firestore {
         && textoAte(request.resource.data.titulo, 120)
         && textoAte(request.resource.data.desc, 2000)
         && getAfter(/databases/$(database)/documents/limites/$(request.auth.uid)).data.ultimo == request.time;
-      // Só Representante e Gestor mudam o status (e nada além dos campos de atendimento).
+
       allow update: if ehAdministrador()
         && soMudou(['status', 'confirmadoEm', 'atendente', 'atendenteUid'])
         && request.resource.data.status in ['pendente', 'confirmado', 'atendimento', 'atendido', 'cancelado'];
       allow delete: if false;
     }
 
-    // Controle de frequência (anti-abuso / anti-flood) para novos chamados.
     match /limites/{uid} {
       allow read: if logado() && request.auth.uid == uid;
       allow create: if logado() && request.auth.uid == uid
@@ -84,14 +74,11 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Fila de atendimento sem dados pessoais (prioridade, horário e status),
-    // para o funcionário ver a sua posição sem ler os chamados dos colegas.
     match /fila/{id} {
       allow read: if logado();
       allow write: if ehAdministrador();
     }
 
-    // ---------- atividades ----------
     match /atividades/{id} {
       allow read: if eh(['diamante', 'gestor', 'ti'])
         || (logado() && request.auth.uid in resource.data.membrosUids);
@@ -104,7 +91,6 @@ service cloud.firestore {
       allow delete: if eh(['gestor']) || (eh(['diamante']) && resource.data.porUid == request.auth.uid);
     }
 
-    // ---------- mural ----------
     match /posts/{id} {
       allow read: if logado();
       allow create: if ehAdministrador()
@@ -114,7 +100,6 @@ service cloud.firestore {
       allow delete: if eh(['gestor']);
     }
 
-    // ---------- auditoria (somente acrescentar; só a TI lê) ----------
     match /auditoria/{id} {
       allow read: if eh(['ti']);
       allow create: if logado()
@@ -123,7 +108,6 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
-    // ---------- chaves públicas RSA (imutáveis) ----------
     match /chaves/{kid} {
       allow read: if eh(['ti']) || (logado() && (resource == null || resource.data.uid == request.auth.uid));
       allow create: if logado() && request.resource.data.uid == request.auth.uid
@@ -131,6 +115,5 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
-    // Qualquer outra coleção: bloqueada.
   }
 }

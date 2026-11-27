@@ -1,23 +1,3 @@
-/*
- * WorkLink - Plataforma Corporativa de Gestão e Comunicação Remota
- * Disciplina: Desenvolvimento de Soluções Remotas
- *
- * Organização do arquivo:
- *   1. Configuração do Firebase (valores injetados pelo GitHub Actions a partir dos Secrets)
- *   2. Constantes e estado da aplicação
- *   3. Funções auxiliares
- *   4. Camada de dados (Firestore, com modo local de reserva) e autenticação (Firebase Auth)
- *   5. Segurança: MFA (simulado), criptografia RSA (assinatura da auditoria), sessão
- *   6. Telas: login, monitoramento, equipe, atividades, chamados, mural e documentos
- *   7. Eventos, acessibilidade, rede (QoS) e conexão
- */
-
-/* ===== 1. FIREBASE =====
- * Os marcadores abaixo são substituídos no deploy (.github/workflows/deploy.yml) pelos Secrets
- * do repositório. Sem eles (ex.: abrindo o arquivo localmente), o app roda em MODO LOCAL.
- * Observação: a apiKey do Firebase não é uma senha; quem protege os dados são o Firebase
- * Authentication e as Regras do Firestore (arquivo firestore.rules).
- */
 var CONFIG_FIREBASE = {
   apiKey: "__FIREBASE_API_KEY__",
   authDomain: "__FIREBASE_AUTH_DOMAIN__",
@@ -27,7 +7,7 @@ var CONFIG_FIREBASE = {
   appId: "__FIREBASE_APP_ID__",
 };
 var NUVEM_CONFIGURADA = CONFIG_FIREBASE.apiKey.indexOf("__") !== 0;
-var fb = null; // { auth, db, A (módulo auth), F (módulo firestore) }
+var fb = null;
 var erroNuvem = false;
 var firebasePronto = NUVEM_CONFIGURADA
   ? (function () {
@@ -39,7 +19,7 @@ var firebasePronto = NUVEM_CONFIGURADA
       ])
         .then(function (m) {
           var app = m[0].initializeApp(CONFIG_FIREBASE);
-          // Sessão só em memória: recarregar a página exige novo login (senha + MFA).
+
           var auth = m[1].initializeAuth(app, { persistence: m[1].inMemoryPersistence });
           fb = { auth: auth, db: m[2].getFirestore(app), A: m[1], F: m[2] };
         })
@@ -50,7 +30,6 @@ var firebasePronto = NUVEM_CONFIGURADA
     })()
   : Promise.resolve();
 
-/* ===== 2. CONSTANTES E ESTADO ===== */
 var NOME_DO_PERFIL = {
   func: "Funcionário",
   diamante: "Representante Diamante 💎",
@@ -74,22 +53,22 @@ var NIVEL_DE_ACESSO = {
     2: "Representante, Gestor ou TI",
     3: "Gestor ou TI",
   };
-// MFA (simulado): código aleatório, validade curta e limite de tentativas/reenvios.
+
 var MFA_VALIDADE_MS = 60 * 1000,
   MFA_MAX_TENTATIVAS = 3,
   MFA_MAX_ENVIOS = 3;
-// Sessão: encerra após 15 minutos sem interação.
+
 var LIMITE_INATIVIDADE_MS = 15 * 60 * 1000;
-// Limite de frequência para abrir chamados (também aplicado nas Regras do Firestore).
+
 var INTERVALO_CHAMADOS_MS = 10 * 1000;
-// QoS da fila: menor peso = atendido antes. Envelhecimento evita que "Baixa" espere para sempre.
+
 var PESO_PRIORIDADE = { Alta: 0, Média: 1, Baixa: 2 },
   ENVELHECIMENTO_MS = 30 * 60 * 1000;
 
 var estado = {
-  user: null, // { uid, nome, email, perfil }
-  tmp: null, // usuário entre a senha e o MFA
-  auth: 0, // 0 = senha, 1 = MFA
+  user: null,
+  tmp: null,
+  auth: 0,
   cadastro: false,
   mfa: null,
   tab: "atividades",
@@ -106,7 +85,6 @@ var estado = {
 var areaPrincipal = document.getElementById("v"),
   avisoLeitorTela = document.getElementById("live");
 
-/* ===== 3. FUNÇÕES AUXILIARES ===== */
 function porId(i) {
   return document.getElementById(i);
 }
@@ -142,7 +120,7 @@ function mostrarErro(m, f) {
     el.focus();
   }
 }
-// Confirmação em 2 cliques no próprio botão (prevenção de erros sem popup bloqueante).
+
 function confirmarClique(b, textoConfirmar) {
   if (b.dataset.conf === "1") {
     clearTimeout(Number(b.dataset.confT || 0));
@@ -166,7 +144,7 @@ function confirmarClique(b, textoConfirmar) {
   );
   return false;
 }
-// Preserva o foco do teclado (e o estado de <details>) quando uma área é redesenhada em tempo real.
+
 function seletorDoElemento(el) {
   if (!el || el === document.body) return null;
   if (el.id) return "#" + el.id;
@@ -259,7 +237,7 @@ function deBase64(t) {
   for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
   return b;
 }
-// Botões em processamento: evita cliques repetidos (formulários).
+
 function ocupar(b, texto) {
   estado.busy = true;
   if (!b) return;
@@ -274,7 +252,7 @@ function liberar(b) {
     b.textContent = b.dataset.txt || b.textContent;
   }
 }
-// Ações por item (confirmar, concluir, excluir...): ignora repetições até a anterior terminar.
+
 var acoesEmAndamento = {};
 function executarUmaVez(chave, botao, fn) {
   if (acoesEmAndamento[chave]) return;
@@ -296,7 +274,6 @@ function executarUmaVez(chave, botao, fn) {
     });
 }
 
-/* ===== 4. CAMADA DE DADOS ===== */
 var COLECOES = ["chamados", "posts", "atividades", "usuarios", "auditoria", "fila", "chaves", "limites"],
   memoriaLocal = {},
   ouvintesLocais = {};
@@ -312,7 +289,7 @@ function listarMemoria(n, filtro) {
     .filter(function (x) {
       if (!filtro) return true;
       if (filtro[1] === "==") return x[filtro[0]] === filtro[2];
-      return (x[filtro[0]] || []).indexOf(filtro[2]) >= 0; // array-contains
+      return (x[filtro[0]] || []).indexOf(filtro[2]) >= 0;
     });
 }
 function avisarOuvintes(n) {
@@ -320,7 +297,7 @@ function avisarOuvintes(n) {
     o.cb(listarMemoria(n, o.filtro));
   });
 }
-// Latência das gravações na nuvem (exibida no painel de monitoramento).
+
 var latencias = [];
 function medir(p) {
   var t0 = performance.now();
@@ -331,7 +308,7 @@ function medir(p) {
   });
 }
 var Dados = {
-  // filtro opcional: [campo, "==" | "array-contains", valor]
+
   sub: function (n, cb, filtro) {
     if (fb) {
       var F = fb.F,
@@ -388,7 +365,7 @@ var Dados = {
     avisarOuvintes(n);
     return Promise.resolve();
   },
-  // Várias gravações atômicas. ops: [tipo ("set"|"merge"|"upd"|"del"), colecao, id, objeto]
+
   lote: function (ops) {
     if (fb) {
       var F = fb.F,
@@ -413,8 +390,7 @@ var Dados = {
     Object.keys(tocadas).forEach(avisarOuvintes);
     return Promise.resolve();
   },
-  // Cria um documento registrando o horário do servidor em limites/{uid}.
-  // As Regras do Firestore recusam se a última criação foi há menos de 10 s (anti-abuso).
+
   criarComLimite: function (n, id, o) {
     var uid = estado.user.uid;
     if (fb) {
@@ -431,7 +407,6 @@ var Dados = {
   },
 };
 
-/* ---- autenticação (Firebase Authentication; no modo local, contas em memória) ---- */
 var contasLocais = {};
 function resumoSenha(s) {
   if (!window.crypto || !crypto.subtle) return Promise.resolve(s);
@@ -485,15 +460,6 @@ function mensagemErroAuth(e) {
   );
 }
 
-/* ===== 5. SEGURANÇA ===== */
-
-/* ---- Criptografia RSA (Web Crypto API) ----
- * Cada usuário gera no próprio aparelho um par de chaves RSA-PSS de 2048 bits.
- * A chave privada é marcada como NÃO exportável e fica no IndexedDB do navegador;
- * só a chave pública vai para a nuvem (coleção "chaves", imutável pelas regras).
- * Todo registro de auditoria é assinado; a TI verifica a assinatura com a chave pública
- * e detecta registros forjados ou adulterados.
- */
 function abrirCofre() {
   return new Promise(function (ok, falha) {
     if (!window.indexedDB) return falha(new Error("sem IndexedDB"));
@@ -560,7 +526,7 @@ var Cripto = {
               publicExponent: new Uint8Array([1, 0, 1]),
               hash: "SHA-256",
             },
-            false, // chave privada não exportável
+            false,
             ["sign", "verify"],
           )
           .then(function (par) {
@@ -646,11 +612,6 @@ function registrarAuditoria(acao) {
     });
 }
 
-/* ---- MFA (simulado) ----
- * Em produção, o código viria de um app autenticador (TOTP) ou SMS via Firebase Identity
- * Platform. Aqui ele é gerado com crypto.getRandomValues, vale 60 s, aceita 3 tentativas
- * e 3 envios; ao estourar o limite, a sessão é encerrada e o evento vai para a auditoria.
- */
 var contagemMFA = null;
 function gerarCodigoMFA() {
   var n = new Uint32Array(1);
@@ -723,7 +684,6 @@ function encerrarSessao(msg) {
     });
 }
 
-/* ===== 6. TELAS ===== */
 function abasDoPerfil() {
   var t = [
     ["atividades", "Atividades"],
@@ -846,7 +806,6 @@ function agendarRedesenho() {
   }, 80);
 }
 
-/* ---- rede (QoS) ---- */
 function infoRede() {
   var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
   return c
@@ -858,7 +817,6 @@ function tempoDeCarregamento() {
   return n && n.domContentLoadedEventEnd ? Math.round(n.domContentLoadedEventEnd) : null;
 }
 
-/* ---- monitoramento (TI) ---- */
 var verificacoes = {};
 function verificarRegistro(x) {
   if (verificacoes[x.id]) return verificacoes[x.id];
@@ -866,7 +824,7 @@ function verificarRegistro(x) {
   var ch = estado.chaves.filter(function (k) {
     return k.id === x.kid;
   })[0];
-  if (!ch) return "semchave"; // a chave pode ainda não ter chegado; não guarda em cache
+  if (!ch) return "semchave";
   if (ch.uid !== x.quemUid) return (verificacoes[x.id] = "falha");
   verificacoes[x.id] = "verificando";
   Cripto.verificar(ch.jwk, textoAssinado(x), x.assinatura)
@@ -1037,7 +995,6 @@ function desenharMonitoramento(p) {
   });
 }
 
-/* ---- equipe (somente Gestor altera perfis) ---- */
 function desenharEquipe(p) {
   var L = estado.us.slice().sort(function (a, b) {
     return String(a.nome).localeCompare(String(b.nome));
@@ -1107,7 +1064,6 @@ function desenharEquipe(p) {
   });
 }
 
-/* ---- atividades ---- */
 function membrosPermitidos() {
   var a = ehGestor() ? ["func", "diamante"] : ["func"];
   return estado.us
@@ -1404,7 +1360,6 @@ function desenharAtividades(p) {
   });
 }
 
-/* ---- chamados ---- */
 function etiquetaStatus(st) {
   var m = {
     pendente: ["", "Pendente"],
@@ -1437,8 +1392,7 @@ function botaoDeAcao(id, s, t, tt, pri) {
     "</button> "
   );
 }
-// QoS: quem está em atendimento fica no topo; depois, menor peso de prioridade
-// (com envelhecimento a cada 30 min de espera) e, em empate, ordem de confirmação.
+
 function pesoQoS(a, agora) {
   var p = PESO_PRIORIDADE[a.prio];
   if (p == null) p = 1;
@@ -1722,8 +1676,7 @@ function desenharChamados(p) {
       if (!c) return;
       if (st === "cancelado" && !confirmarClique(b, "Confirmar cancelamento?")) return;
       executarUmaVez("ch-" + id, b, function () {
-        // A coleção "fila" guarda só prioridade/horário/status (sem dados pessoais),
-        // para o funcionário saber a posição sem poder ler chamados de outras pessoas.
+
         var up = { status: st },
           ops;
         if (st === "confirmado") {
@@ -1772,7 +1725,6 @@ function desenharChamados(p) {
   });
 }
 
-/* ---- mural e documentos ---- */
 function desenharMural(p) {
   if (!porId("pl")) {
     p.innerHTML =
@@ -1868,7 +1820,6 @@ function desenharDocumentos(p) {
   });
 }
 
-/* ===== 7. DADOS EM TEMPO REAL, LOGIN E EVENTOS ===== */
 var ABAS_AFETADAS = {
     chamados: ["chamados", "monitor"],
     atividades: ["atividades", "monitor"],
@@ -1887,7 +1838,7 @@ var ABAS_AFETADAS = {
     chaves: "chaves",
     fila: "fila",
   };
-// Cada perfil assina só o que as Regras do Firestore permitem ler.
+
 function assinarDados() {
   estado.unsubs.forEach(function (u) {
     u && u();
@@ -1948,7 +1899,7 @@ function aoEnviarLogin() {
           perfil: doc ? doc.perfil : perfilLocal || "func",
           novo: !doc,
         };
-        Cripto.preparar(c.uid); // gera/carrega as chaves RSA enquanto o usuário digita o MFA
+        Cripto.preparar(c.uid);
         iniciarMFA();
         estado.busy = false;
         estado.auth = 1;
@@ -2085,7 +2036,6 @@ function ligarEventos() {
   });
 }
 
-/* ---- acessibilidade (preferências salvas no navegador) ---- */
 function lerPref(k) {
   try {
     return localStorage.getItem("wl-" + k);
@@ -2123,7 +2073,6 @@ porId("ct").onclick = function () {
   salvarPref("ct", on ? "1" : "0");
 };
 
-/* ---- modo leve (manual ou automático em rede lenta) ---- */
 var prefLeve = lerPref("lt"),
   modoLeveManual = prefLeve !== null;
 function aplicarModoLeve(on, mensagem) {
@@ -2154,7 +2103,6 @@ function avaliarRede() {
 var conexao = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
 if (conexao && conexao.addEventListener) conexao.addEventListener("change", avaliarRede);
 
-/* ---- sessão: encerra após inatividade ---- */
 var ultimaAtividade = Date.now();
 ["click", "keydown", "pointerdown", "touchstart"].forEach(function (ev) {
   document.addEventListener(
@@ -2174,7 +2122,6 @@ setInterval(function () {
   }
 }, 30000);
 
-/* ---- conexão ---- */
 function verificarConexao() {
   porId("net").hidden = navigator.onLine;
   if (estado.user && estado.tab === "monitor") agendarRedesenho();
